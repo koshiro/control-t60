@@ -1,6 +1,7 @@
 // Pruebas en el host de los ajustes editables (menú + NVS): pio test -e native.
 // Lo que importa para la seguridad: nada que venga del menú o de la NVS (vacía, de otro esquema, corrupta) puede
 // dejar la cadencia bajo el piso medido ni un nivel sobre el TOPE.
+#include <string.h>
 #include <unity.h>
 
 #include <map>
@@ -152,6 +153,17 @@ static void test_auto_disarm_fields() {
   TEST_ASSERT_TRUE(load(s, gesture::defaults()).autoDisarm);
 }
 
+// "Tiempo bloqueo" solo es seleccionable con el auto-desarme activado; el resto de los campos siempre.
+static void test_lock_time_disabled_without_auto_disarm() {
+  gesture::Config c = gesture::defaults();
+  for (int i = 0; i < kCount; i++) TEST_ASSERT_TRUE_MESSAGE(enabled(c, i), field(i).key);
+  set(c, 10, 0);
+  for (int i = 0; i < kCount; i++)
+    TEST_ASSERT_EQUAL_MESSAGE(strcmp(field(i).key, "tblq") != 0, enabled(c, i), field(i).key);
+  set(c, 10, 1);
+  TEST_ASSERT_TRUE(enabled(c, 11));
+}
+
 // Fuzz: valores arbitrarios (incluidos extremos de int32) en NVS y en el menú → siempre seguro.
 static void test_fuzz_store_and_menu() {
   std::mt19937 rng(1234);
@@ -218,6 +230,7 @@ int main() {
   RUN_TEST(test_fuzz_store_and_menu);
   RUN_TEST(test_light_mode_store);
   RUN_TEST(test_auto_disarm_fields);
+  RUN_TEST(test_lock_time_disabled_without_auto_disarm);
   RUN_TEST(test_shock_switch_persists);
   return UNITY_END();
 }

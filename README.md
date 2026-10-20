@@ -28,7 +28,7 @@ decodificó de mi propio collar (2-FSK 433.92 MHz, ±12.7 kHz, bit de 104.2 µs)
 - **Pantalla apagada por defecto** (backlight y panel en sleep). El menú (LVGL 9) muestra estado, controla la
   **luz** del collar (encender/apagar, modo 1-3) y edita: cadencia, rampa mín/máx (TOPE), vibrar, shock
   BAJO/ALTO, sensibilidad de armado, pausa de gracia, zona de seguridad, paso de rampa, desarme automático
-  (on/off) y tiempo de bloqueo (10–600 s). **Guardar** escribe en NVS; KEY / Salir / 60 s inactivo descartan.
+  (on/off) y tiempo de bloqueo (10–600 s; deshabilitado si el desarme automático está apagado). **Guardar** escribe en NVS; KEY / Salir / 60 s inactivo descartan.
 - **Seguridad:** arranca siempre desarmado; desarme por inactividad (desactivable); TOPE duro sobre todo nivel; cadencia
   mínima y tope de estímulos por minuto; watchdog que fuerza el CC1101 a IDLE; "soltar" al final de cada pulso.
 - **Shock:** doble barrera. `ALLOW_SHOCK` en compilación (techo) + interruptor `shock on|off` **solo por
@@ -49,7 +49,7 @@ tools/          t60cmd.py (comandos por serial), gen_vectors.py (vectores de pru
 ## ID del collar (`.env`)
 
 El collar solo obedece tramas con **su** ID de 2 bytes. Ese ID **no está en el repositorio**: se lee de `.env`
-(ignorado por git) al compilar el firmware, vía `tools/env_id.py`.
+(ignorado por git) al compilar el firmware, vía `tools/build_env.py`.
 
 ```sh
 cp .env.example .env    # y poner el ID de tu collar: T60_ID=0xHHLL
@@ -71,13 +71,17 @@ pio run -e tembed -t upload        # flashear (auto-reset por USB)
 
 Si tras flashear el serial queda mudo, apretar **RST**.
 
+El build graba la versión (`git describe --dirty`) en el firmware —`ver` o `ping` la muestran— y **se niega a
+compilar si el checkout está atrás de `origin/main`** (hace un `git fetch` corto antes), para no flashear una
+versión vieja.
+
 ## Comandos serie (115200, USB CDC)
 
 `python tools/t60cmd.py "<comando>"` detecta el puerto solo (VID 0x303A).
 
 | Comando | Qué hace |
 |---|---|
-| `ping`, `regs` | estado del CC1101 / registros vs datasheet |
+| `ping`, `ver`, `regs` | estado del CC1101 + versión del firmware / registros vs datasheet |
 | `gstat`, `log` | parámetros y estado / registro entrada→decisión→trama (incluye duración de cada TX) |
 | `set <campo> <valor>` | ajuste en vivo (no se guarda) |
 | `menu [save\|exit]`, `nvs [clear]` | menú y ajustes guardados |

@@ -8,7 +8,7 @@
 
 namespace t60 {
 
-// ID del collar: NO se versiona. El firmware lo recibe de `.env` (T60_ID=0xHHLL) vía tools/env_id.py; las pruebas
+// ID del collar: NO se versiona. El firmware lo recibe de `.env` (T60_ID=0xHHLL) vía tools/build_env.py; las pruebas
 // host usan un ID de ejemplo (-DT60_ID=0x1234 en [env:native]).
 #ifndef T60_ID
 #error "Falta T60_ID: crea .env con T60_ID=0xHHLL (ver .env.example)"

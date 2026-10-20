@@ -1,5 +1,7 @@
 #include "settings.h"
 
+#include <string.h>
+
 namespace settings {
 
 // Rangos: la cadencia no baja de 500 ms (medido 2026-10-20: a ≤0.84 s el collar ya pierde pulsos; 0.94 s es el
@@ -28,6 +30,11 @@ int32_t clampField(int i, int32_t v) {
   v = f.min + (v - f.min + f.step / 2) / f.step * f.step;  // al paso más cercano
   if (v > f.max) v -= f.step;
   return v;
+}
+
+bool enabled(const gesture::Config &c, int i) {
+  if (!strcmp(kFields[i].key, "tblq")) return c.autoDisarm;
+  return true;
 }
 
 int32_t get(const gesture::Config &c, int i) {

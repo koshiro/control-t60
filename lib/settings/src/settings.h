@@ -25,6 +25,9 @@ const Field &field(int i);
 int32_t get(const gesture::Config &c, int i);           // valor del campo i en unidades de pantalla
 void set(gesture::Config &c, int i, int32_t v);         // recorta a [min,max], ajusta al paso y escribe
 int32_t clampField(int i, int32_t v);
+// ¿El campo i aplica con esta config? (p.ej. "Tiempo bloqueo" solo con auto-desarme activado). El menú muestra
+// deshabilitados los que no aplican y el foco del encoder los salta; su valor se conserva y se sigue guardando.
+bool enabled(const gesture::Config &c, int i);
 // Recorta todos los campos a su rango y aplica la regla del TOPE (BAJO/ALTO/mín/vibrar/tono <= cap), igual que
 // Machine::reset(): lo que muestra el menú es exactamente lo que usará la máquina y lo que se guarda.
 void normalize(gesture::Config &c);

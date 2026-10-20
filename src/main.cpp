@@ -36,6 +36,9 @@
 #include <lvgl.h>
 #include "t60frame.h"
 
+#ifndef FW_VERSION
+#define FW_VERSION "sin-version"  // lo define tools/build_env.py (git describe)
+#endif
 #ifndef ALLOW_SHOCK
 #define ALLOW_SHOCK 0
 #endif
@@ -702,7 +705,9 @@ static void handle(char *line) {
   int argc = 0;
   for (char *tok = strtok(line, " \t"); tok && argc < 8; tok = strtok(nullptr, " \t")) argv[argc++] = tok;
   if (!argc) return;
-  if (!strcmp(argv[0], "ping")) Serial.printf("PONG control-t60 0x%02X 0x%02X\n", readStatus(PARTNUM), readStatus(VERSION));
+  if (!strcmp(argv[0], "ping"))
+    Serial.printf("PONG control-t60 0x%02X 0x%02X %s\n", readStatus(PARTNUM), readStatus(VERSION), FW_VERSION);
+  else if (!strcmp(argv[0], "ver")) Serial.printf("VER %s\n", FW_VERSION);  // = git describe del build
   else if (!strcmp(argv[0], "regs")) cmdRegs();
   else if (!strcmp(argv[0], "tx")) cmdTx(argc, argv);
   else if (!strcmp(argv[0], "txramp")) cmdTxRamp(argc, argv);
@@ -718,7 +723,7 @@ static void handle(char *line) {
   else if (!strcmp(argv[0], "nvs")) cmdNvs(argc, argv);
   else if (!strcmp(argv[0], "shock")) cmdShock(argc, argv);
   else if (!strcmp(argv[0], "beep")) { beep(argc > 1 ? atoi(argv[1]) : 1800, argc > 2 ? atoi(argv[2]) : 150); Serial.println("BEEP"); }
-  else Serial.println("ERR comandos: ping regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock beep");
+  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock beep");
 }
 
 // ================================================================ Fase 5: control por gestos
@@ -1073,6 +1078,11 @@ static void uiLoadValues() {
     } else {
       lv_slider_set_value(g_sl[i], (v - f.min) / f.step, LV_ANIM_OFF);
     }
+    // Campo que no aplica (p.ej. "Tiempo bloqueo" con auto-desarme apagado): fila atenuada y el foco lo salta.
+    bool en = settings::enabled(g_edit, i);
+    if (en) lv_obj_remove_state(g_sl[i], LV_STATE_DISABLED);
+    else lv_obj_add_state(g_sl[i], LV_STATE_DISABLED);
+    lv_obj_set_style_opa(lv_obj_get_parent(g_sl[i]), en ? LV_OPA_COVER : LV_OPA_40, 0);
     fmtValue(i, v, buf, sizeof buf);
     lv_label_set_text(g_val[i], buf);
   }
