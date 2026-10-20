@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+*.tgz
+__pycache__/
+.claude/
+.env
+test/test_frame/vectors_local.h
