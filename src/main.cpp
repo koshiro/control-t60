@@ -730,6 +730,7 @@ static void cmdMenu(int argc, char **argv);
 static void cmdNvs(int argc, char **argv);
 static void cmdShock(int argc, char **argv);
 static void cmdPwr();
+static void uiUpdateBattery();  // refresca el indicador de batería del menú (definido tras cmdPwr/g_gauge)
 static void cmdSleep(int argc, char **argv);
 static void pollCombo(uint32_t now);
 
@@ -1082,6 +1083,7 @@ static lv_display_t *g_disp;
 static uint8_t g_lvBuf[320 * 24 * 2];  // buffer parcial: 24 líneas
 static lv_obj_t *g_sl[settings::kCount], *g_val[settings::kCount], *g_hdr, *g_hdrState, *g_hdrInfo;
 static lv_obj_t *g_lightSw, *g_lightDd, *g_noteShock;
+static lv_obj_t *g_batLabel;  // indicador de batería (primera fila del menú); lo refresca uiUpdateBattery()
 
 static void lvFlush(lv_display_t *d, const lv_area_t *a, uint8_t *px) {
   uint32_t w = lv_area_get_width(a), h = lv_area_get_height(a);
@@ -1254,6 +1256,14 @@ static void uiBuild() {
   lv_style_set_bg_opa(&rowSel, LV_OPA_COVER);
   lv_style_set_bg_color(&rowSel, lv_color_hex(0x1E3A40));
 
+  // Indicador de batería: primera fila, siempre visible al abrir (el menú arranca con scroll arriba). No entra al
+  // grupo de foco → el encoder lo salta; es solo lectura. Lo llena uiUpdateBattery() desde el gauge BQ27220.
+  g_batLabel = lv_label_create(list);
+  lv_obj_set_style_text_font(g_batLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_pad_left(g_batLabel, 8, 0);
+  lv_obj_set_style_pad_ver(g_batLabel, 2, 0);
+  lv_label_set_text(g_batLabel, "Bateria: --");
+
   {  // fila de luz (acción inmediata, no es un ajuste de gestos): Luz [interruptor] [modo]
     lv_obj_t *row = lv_obj_create(list);
     lv_obj_add_style(row, &rowSt, 0);
@@ -1381,6 +1391,7 @@ static void menuOpen() {
   g_menuActivity = millis();
   uiLoadValues();
   uiUpdateHeader();
+  uiUpdateBattery();  // lectura inmediata al abrir; pollUi la refresca cada 3 s
   lv_dropdown_set_selected(g_lightDd, g_lightMode - 1);
   if (g_lightOn) lv_obj_add_state(g_lightSw, LV_STATE_CHECKED);
   else lv_obj_remove_state(g_lightSw, LV_STATE_CHECKED);
@@ -1454,6 +1465,8 @@ static void pollUi() {
   if (millis() - last < 5) return;
   last = millis();
   uiUpdateHeader();
+  static uint32_t lastBat;
+  if (millis() - lastBat > 3000) { lastBat = millis(); uiUpdateBattery(); }
   if (!lcdLock()) return;  // TX en curso → reintentar en la próxima vuelta
   lv_timer_handler();
   lcdUnlock();
@@ -1594,6 +1607,29 @@ static void cmdPwr() {
   Serial.printf("PWR heap libre=%u interno=%u mayor_bloque_interno=%u\n", (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// Indicador de batería del menú: misma fuente que `pwr` (fuel-gauge BQ27220, solo lectura). Lo invoca uiUpdateBattery
+// desde menuOpen (inmediato) y pollUi (cada 3 s), en el contexto del loop (core 1) → no toca el bus SPI del LCD, así
+// que no necesita lcdLock. Color: cian=cargando, verde>50%, ámbar 20-50%, rojo<20%, gris=sin lectura.
+static void uiUpdateBattery() {
+  if (!g_batLabel) return;
+  auto noRead = [] {
+    lv_label_set_text(g_batLabel, "Bateria: sin lectura");
+    lv_obj_set_style_text_color(g_batLabel, lv_color_hex(0x9E9E9E), 0);
+  };
+  if (!g_gaugeOk) { noRead(); return; }
+  uint16_t mv = g_gauge.getVoltage();
+  int16_t cur = g_gauge.getCurrent();         // + carga / − descarga
+  uint16_t soc = g_gauge.getStateOfCharge();  // %
+  if (mv <= 2500 || mv >= 4500) { noRead(); return; }  // fuera de rango → el gauge no respondió
+  char buf[48];
+  if (cur > 5) snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V  cargando", soc, mv / 1000, (mv % 1000) / 10);
+  else if (cur < -5) snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V  %d mA", soc, mv / 1000, (mv % 1000) / 10, cur);
+  else snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V", soc, mv / 1000, (mv % 1000) / 10);
+  lv_label_set_text(g_batLabel, buf);
+  uint32_t col = cur > 5 ? 0x4DD0E1 : soc > 50 ? 0x66BB6A : soc >= 20 ? 0xFFB300 : 0xEF5350;
+  lv_obj_set_style_text_color(g_batLabel, lv_color_hex(col), 0);
 }
 
 // ---------------------------------------------------------------- sleep (fases 3 y 4 de power)
