@@ -28,6 +28,10 @@
 #include <driver/i2s_std.h>
 #include <driver/pulse_cnt.h>
 
+#include <driver/gpio.h>    // gpio_wakeup_enable (wake por flanco en light sleep)
+#include <driver/rtc_io.h>  // rtc_gpio_pullup_en (wake ext1 en deep sleep)
+#include <esp_sleep.h>      // light/deep sleep (fases 3 y 4 de power)
+
 #include "gesture.h"
 #include "lcd.h"
 #include "settings.h"
@@ -35,6 +39,8 @@
 #include <Preferences.h>
 #include <lvgl.h>
 #include "t60frame.h"
+
+#include <bq27220.h>  // fuel-gauge BQ27220 (I2C 0x55, SDA=8/SCL=18): medición de batería/consumo (fase 0 de power)
 
 #ifndef FW_VERSION
 #define FW_VERSION "sin-version"  // lo define tools/build_env.py (git describe)
@@ -73,7 +79,7 @@ enum : uint8_t {
   IOCFG2 = 0x00, IOCFG0 = 0x02, PKTCTRL0 = 0x08, FREQ2 = 0x0D, FREQ1 = 0x0E, FREQ0 = 0x0F,
   MDMCFG4 = 0x10, MDMCFG3 = 0x11, MDMCFG2 = 0x12, DEVIATN = 0x15, MCSM0 = 0x18, FREND0 = 0x22,
   FSCAL3 = 0x23, FSCAL2 = 0x24, FSCAL1 = 0x25, PATABLE = 0x3E,
-  SRES = 0x30, STX = 0x35, SIDLE = 0x36,
+  SRES = 0x30, STX = 0x35, SIDLE = 0x36, SPWD = 0x39,  // SPWD: power-down (SLEEP, ~200 nA; registros retenidos)
   PARTNUM = 0x30, VERSION = 0x31, MARCSTATE = 0x35,
 };
 static constexpr uint8_t MARC_IDLE = 0x01, MARC_TX = 0x13;
@@ -127,6 +133,9 @@ static SemaphoreHandle_t g_spiLock;
 static SemaphoreHandle_t g_rfMutex;
 static inline void rfLock() { xSemaphoreTake(g_rfMutex, portMAX_DELAY); }
 static inline void rfUnlock() { xSemaphoreGive(g_rfMutex); }
+// Fase 2 (power): espejo del estado de armado visible desde transmitRuns() (g_m se define más abajo). Con el
+// control DESARMADO el CC1101 duerme (SPWD); al terminar una TX de banco se vuelve a dormir.
+static volatile bool g_armed = false;
 
 // ---------------------------------------------------------------- driver CC1101 (base: capturador/src/main.cpp)
 static void csLow() {
@@ -179,6 +188,11 @@ static void cc1101Config() {
   waitMarc(MARC_IDLE, 50);
 }
 
+// Fase 2 (power): dormir/despertar el CC1101 según armado. En SLEEP los registros se retienen, así que al
+// despertar basta SIDLE (no hace falta re-config). Llamar con g_rfMutex tomado (o en setup, antes de las tareas).
+static void cc1101Sleep() { strobe(SIDLE); strobe(SPWD); }           // ~200 nA
+static void cc1101Wake() { strobe(SIDLE); waitMarc(MARC_IDLE, 50); } // vuelve a IDLE (~1.6 mA)
+
 // ---------------------------------------------------------------- RMT (dato TX en GDO0)
 static rmt_channel_handle_t g_rmt;
 static rmt_encoder_handle_t g_copy;
@@ -214,7 +228,16 @@ static inline uint32_t gdo0Level() { return (REG_READ(GPIO_IN_REG) >> PIN_GDO0) 
 static constexpr uint16_t LEAD_TICKS = 20000;
 
 static void toSymbols(const t60::Run *runs, int n, std::vector<rmt_symbol_word_t> &out) {
-  std::vector<std::pair<uint8_t, uint16_t>> halves{{0, LEAD_TICKS}};
+  // Reservar el tamaño exacto de una (precontando las mitades por corrida, ceil(t/30000) cada una) en vez de
+  // dejar crecer el vector a saltos: el realloc por duplicación necesita old+new contiguos a la vez y con el
+  // heap fragmentado (bloque interno mayor ~32 KB) reventaba a partir de 3 tramas con bad_alloc. 1 sola
+  // asignación del tamaño final cae holgada. (5-6 tramas igual no entran en el bloque → límite de heap aparte.)
+  size_t nh = 1;  // la mitad inicial del preámbulo en bajo (LEAD_TICKS)
+  for (int i = 0; i < n; i++) nh += (runs[i].tenthsUs + 29999) / 30000;
+  nh += 2;  // margen: posible partición de paridad + el ajuste de −2 ticks
+  std::vector<std::pair<uint8_t, uint16_t>> halves;
+  halves.reserve(nh);
+  halves.push_back({0, LEAD_TICKS});
   for (int i = 0; i < n; i++) {
     uint32_t t = runs[i].tenthsUs;  // décimas de µs = ticks a 10 MHz
     while (t > 0) {
@@ -230,6 +253,7 @@ static void toSymbols(const t60::Run *runs, int n, std::vector<rmt_symbol_word_t
     halves.push_back({last.first, (uint16_t)(last.second - last.second / 2)});
   }
   out.clear();
+  out.reserve(nh / 2 + 1);
   for (size_t i = 0; i < halves.size(); i += 2) {
     rmt_symbol_word_t s;
     s.level0 = halves[i].first;
@@ -445,6 +469,7 @@ static void transmitRuns(int n, uint32_t wdMs, bool doReport, int framesSent) {
                 g_wdFired ? "(watchdog)" : String(marcEnd, HEX).c_str(), idle ? "IDLE" : "NO-IDLE", (unsigned)lvl,
                 g_wdFired ? "DISPARÓ" : "no", done ? "completo" : "cortado");
   if (doReport) report(g_runs, n, nEdges, framesSent);
+  if (!g_armed) strobe(SPWD);  // Fase 2: TX de banco (desarmado) → volver a dormir el CC1101
 }
 
 // Una pulsación completa de potencia fija. `wdMs` = 0 → watchdog normal; >0 → forzado (wdtest).
@@ -483,7 +508,10 @@ static void cmdTx(int argc, char **argv) {
     if (!strcmp(argv[i], "badid")) f.idLo = t60::kIdLo ^ 0x01;  // ID vecino: otro collar
   }
   g_seq += 2;  // tramas con seq, soltar con seq+1
+  uint32_t prevFreq = getCpuFrequencyMhz();  // subir a 240 solo para que capture()/report mida con resolución
+  if (prevFreq < 240) setCpuFrequencyMhz(240);
   transmit(f, frames, 0);
+  if (prevFreq < 240) setCpuFrequencyMhz(prevFreq);
 }
 
 // Prueba del punto 3: una sola pulsación (mismo seq) con la potencia cambiando entre niveles → ver si el
@@ -519,7 +547,10 @@ static void cmdTxRamp(int argc, char **argv) {
   for (int i = 0; i < np; i++) Serial.printf(" %u", powers[i]);
   Serial.println();
   g_seq += 2;
+  uint32_t prevFreq = getCpuFrequencyMhz();  // subir a 240 solo para que capture()/report mida con resolución
+  if (prevFreq < 240) setCpuFrequencyMhz(240);
   transmitRuns(n, 0, true, np * per);
+  if (prevFreq < 240) setCpuFrequencyMhz(prevFreq);
   rfUnlock();
 }
 
@@ -698,6 +729,8 @@ static void cmdLcd();
 static void cmdMenu(int argc, char **argv);
 static void cmdNvs(int argc, char **argv);
 static void cmdShock(int argc, char **argv);
+static void cmdPwr();
+static void cmdSleep(int argc, char **argv);
 static void pollCombo(uint32_t now);
 
 static void handle(char *line) {
@@ -722,8 +755,10 @@ static void handle(char *line) {
   else if (!strcmp(argv[0], "menu")) cmdMenu(argc, argv);
   else if (!strcmp(argv[0], "nvs")) cmdNvs(argc, argv);
   else if (!strcmp(argv[0], "shock")) cmdShock(argc, argv);
+  else if (!strcmp(argv[0], "pwr")) cmdPwr();
+  else if (!strcmp(argv[0], "sleep")) cmdSleep(argc, argv);
   else if (!strcmp(argv[0], "beep")) { beep(argc > 1 ? atoi(argv[1]) : 1800, argc > 2 ? atoi(argv[2]) : 150); Serial.println("BEEP"); }
-  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock beep");
+  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock pwr sleep beep");
 }
 
 // ================================================================ Fase 5: control por gestos
@@ -854,6 +889,8 @@ static void encoderInit() {
 
 // --- modo menú (fase 3): con el menú abierto, encoder y botones van a LVGL y NO a la máquina de gestos ---
 static bool g_inMenu;
+static uint32_t g_lastInputMs;  // millis() de la última entrada (encoder/botón) → inactividad para el auto-sleep
+static bool g_autoSleep = true;  // auto light/deep sleep por inactividad (ajuste persistente, Preferences "autoslp")
 static int32_t g_menuDiff;  // muescas pendientes para LVGL (+ = derecha = siguiente/subir)
 static lv_group_t *g_grp;   // grupo de foco del menú (se crea en uiInit)
 static void menuButton(int pin, bool down);
@@ -873,6 +910,7 @@ static void pollEncoder(uint32_t now) {
   int cnt = 0;
   pcnt_unit_get_count(g_pcnt, &cnt);
   int delta = cnt - g_lastCount;
+  if (delta >= COUNTS_PER_DETENT || delta <= -COUNTS_PER_DETENT) g_lastInputMs = millis();  // actividad (auto-sleep)
   while (delta >= COUNTS_PER_DETENT) {
     g_lastCount += COUNTS_PER_DETENT;
     delta -= COUNTS_PER_DETENT;
@@ -898,6 +936,7 @@ static void pollBtn(Btn &b, In downEv, In upEv, uint32_t now) {
   if (raw != b.lastRaw) { b.lastRaw = raw; b.tEdge = now; }
   if (b.pressed != raw && (uint32_t)(now - b.tEdge) >= g_m.config().debounceUs) {
     b.pressed = raw;
+    g_lastInputMs = millis();  // actividad (auto-sleep)
     if (g_inMenu) { menuButton(b.pin, raw); return; }
     In ev = raw ? downEv : upEv;
     logAdd('I', (uint8_t)ev, 0, 0);
@@ -967,6 +1006,10 @@ static void pollGestures() {
   bool armedNow = g_m.armed();
   if (armedNow != prevArmed) {  // confirmación LOCAL (no al collar): armar = beep agudo, desarmar = grave
     beep(armedNow ? 1800 : 500, armedNow ? 120 : 200);
+    g_armed = armedNow;
+    rfLock();  // Fase 2: armar → CC1101 a IDLE (pulsos instantáneos); desarmar → SPWD (~200 nA)
+    if (armedNow) cc1101Wake(); else cc1101Sleep();
+    rfUnlock();
     prevArmed = armedNow;
   }
   updateLed();
@@ -1530,6 +1573,101 @@ static void cmdSet(int argc, char **argv) {
   cmdGstat();
 }
 
+// ---------------------------------------------------------------- batería / consumo (fase 0 de power)
+// Fuel-gauge BQ27220 por I2C (0x55, SDA=8/SCL=18). El T-Embed CC1101 no tiene ADC de batería; se mide por este
+// gauge (driver vendorizado de LilyGO en lib/bq27220). SOLO lectura: no se llama init() (reprogramaría la
+// data-memory del gauge). `getCurrent()` viene con signo: + = cargando, − = descargando (consumo real).
+static BQ27220 g_gauge;
+static bool g_gaugeOk;
+
+static void cmdPwr() {
+  if (!g_gaugeOk) { Serial.println("PWR gauge BQ27220 no inicializado"); return; }
+  uint16_t mv = g_gauge.getVoltage();            // mV
+  int16_t cur = g_gauge.getCurrent();            // mA, + carga / − descarga
+  uint16_t soc = g_gauge.getStateOfCharge();     // %
+  uint16_t rem = g_gauge.getRemainingCapacity(); // mAh
+  uint16_t fcc = g_gauge.getFullChargeCapacity();// mAh
+  const char *dir = cur > 0 ? "cargando" : (cur < 0 ? "descarga" : "reposo");
+  bool sane = mv > 2500 && mv < 4500;  // fuera de rango → probable que el gauge no respondió
+  Serial.printf("PWR soc=%u%% v=%u mV i=%d mA (%s) rem=%u/%u mAh cpu=%u MHz%s\n", soc, mv, cur, dir, rem, fcc,
+                (unsigned)getCpuFrequencyMhz(), sane ? "" : "  [¿gauge sin responder? v fuera de rango]");
+  Serial.printf("PWR heap libre=%u interno=%u mayor_bloque_interno=%u\n", (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// ---------------------------------------------------------------- sleep (fases 3 y 4 de power)
+// DESARMADO e inactivo: tras T1 entra en LIGHT SLEEP (~mA, conserva estado, despierta con la rueda/botón/KEY y
+// puede armarse de corrido); si sigue inactivo hasta T2 escala a DEEP SLEEP (apaga con PWR_EN como el firmware de
+// fábrica, ~µA, despierta con KEY y rebootea). Nunca duerme armado, en pulso, con el menú abierto, con TX encolada
+// ni con USB conectado (para no cortar el serial en el banco). El wake por GPIO es por nivel opuesto al actual
+// (la rueda puede descansar con A o B en bajo), así cualquier cambio despierta.
+static constexpr uint32_t T1_LIGHT_MS = 20000;   // inactivo 20 s → light sleep
+static constexpr uint32_t T2_DEEP_MS = 300000;   // inactivo 5 min → deep sleep
+static constexpr int SLEEP_PINS[] = {PIN_ENC_A, PIN_ENC_B, PIN_ENC_BTN, PIN_KEY};
+
+static void gpioWakeArm() {
+  for (int p : SLEEP_PINS)
+    gpio_wakeup_enable((gpio_num_t)p, digitalRead(p) ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+}
+
+static void enterLightSleep(uint32_t timerMs) {
+  gpioWakeArm();
+  if (timerMs) esp_sleep_enable_timer_wakeup((uint64_t)timerMs * 1000);  // para escalar a deep sin más input
+  esp_light_sleep_start();
+  for (int p : SLEEP_PINS) gpio_wakeup_disable((gpio_num_t)p);
+  // Al despertar: el PCNT no contó dormido y el gesto quedó viejo → limpiar para que un wiggle continuo arme.
+  if (g_pcnt) { pcnt_unit_clear_count(g_pcnt); g_lastCount = 0; }
+  g_m.reset(g_cfg5, micros());
+  g_lastInputMs = millis();
+}
+
+static void enterDeepSleep() {
+  rgbLedWrite(14, 0, 0, 0);
+  digitalWrite(PIN_LCD_BL, LOW);
+  if (g_lcdOk) g_lcd.sleep();
+  rfLock(); cc1101Sleep(); rfUnlock();
+  for (int p : {PIN_LCD_CS, PIN_SD_CS, PIN_NRF_CS, PIN_CSN}) digitalWrite(p, HIGH);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY);
+  esp_sleep_enable_ext1_wakeup(1ULL << PIN_KEY, ESP_EXT1_WAKEUP_ANY_LOW);  // wake con KEY (GPIO6, activo bajo)
+  digitalWrite(PIN_PWR_EN, LOW);  // latch del board (igual que fábrica): corta WS2812/housekeeping → ~µA
+  esp_deep_sleep_start();         // no retorna: al presionar KEY rebootea desde setup()
+}
+
+// Llamada al final de loop(): decide si corresponde dormir.
+static void maybeSleep() {
+  if (!g_autoSleep || g_inMenu || g_m.armed() || g_m.pressActive()) return;
+  if (uxQueueMessagesWaiting(g_txQueue)) return;  // hay pulsos por salir
+  if (Serial) return;                             // USB conectado (banco/cargando): no dormir, mantener serial
+  uint32_t idle = millis() - g_lastInputMs;
+  if (idle < T1_LIGHT_MS) return;
+  if (idle >= T2_DEEP_MS) enterDeepSleep();
+  else enterLightSleep(T2_DEEP_MS - idle);
+}
+
+// `sleep` estado; `sleep on|off` habilita/deshabilita (persistente); `sleep now` fuerza un light sleep de prueba.
+static void cmdSleep(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "now")) {
+    Serial.println("SLEEP light 5 s de prueba (se corta el serial; move la rueda o espera)...");
+    delay(50);
+    enterLightSleep(5000);
+    Serial.println("SLEEP desperto");
+    return;
+  }
+  if (argc > 1 && (!strcmp(argv[1], "on") || !strcmp(argv[1], "off"))) {
+    g_autoSleep = !strcmp(argv[1], "on");
+    Preferences p;
+    if (p.begin("t60", false)) { p.putBool("autoslp", g_autoSleep); p.end(); }
+  } else if (argc > 1) {
+    Serial.println("ERR uso: sleep [on|off|now]");
+    return;
+  }
+  Serial.printf("SLEEP auto=%s (T1=%lus light, T2=%lus deep; no duerme con USB conectado)\n",
+                g_autoSleep ? "on" : "off", (unsigned long)(T1_LIGHT_MS / 1000),
+                (unsigned long)(T2_DEEP_MS / 1000));
+}
+
 // ---------------------------------------------------------------- setup/loop
 void setup() {
   pinMode(PIN_GDO0, INPUT);  // hasta que GDO0 quede en alta impedancia en el CC1101
@@ -1546,6 +1684,12 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(100);
 
+  // Fase 1 (power): correr a 80 MHz en vez de 240 → ~2× autonomía armado. El APB queda fijo en 80 MHz para
+  // CPU ≥ 80, así que RMT/PCNT/I2S/USB-CDC no cambian y la trama de 104.2 µs NO se mueve. 80 MHz es el piso:
+  // por debajo el APB seguiría al CPU y rompería el timing de la TX. Se sube a 240 solo alrededor del
+  // capture()/report de los comandos de banco (tx/txramp), que muestrean GPIO3 por ciclos de CPU.
+  setCpuFrequencyMhz(80);
+
   g_spiLock = xSemaphoreCreateMutex();
   g_rfMutex = xSemaphoreCreateMutex();
   // LCD ANTES que el CC1101: su init hace SPI.end()/SPI.begin() y resetea el periférico FSPI (ver lcd.h).
@@ -1561,6 +1705,7 @@ void setup() {
   cc1101Reset();
   cc1101Config();  // IOCFG0=0x2E antes de que el RMT tome GPIO3 como salida
   rmtInit();
+  cc1101Sleep();  // Fase 2: arranca DESARMADO → el CC1101 duerme; el primer armado/TX lo despierta
 
   xTaskCreatePinnedToCore(wdTask, "t60wd", 3072, nullptr, configMAX_PRIORITIES - 2, &g_wdTask, 0);
 
@@ -1577,12 +1722,15 @@ void setup() {
     g_lightMode = settings::loadLightMode(st);
     g_shockOn = ALLOW_SHOCK && settings::loadShock(st);
   }
+  { Preferences p; if (p.begin("t60", true)) { g_autoSleep = p.getBool("autoslp", true); p.end(); } }  // fase 3/4
   g_m.reset(g_cfg5, micros());  // arranca DESARMADO
   encoderInit();
   audioInit();  // parlante para beeps locales (confirmación de armado); nunca estimula el collar
+  g_gaugeOk = g_gauge.begin();  // I2C del fuel-gauge BQ27220 (SDA=8/SCL=18); medición de batería por `pwr`
   xTaskCreatePinnedToCore(txTask, "t60tx", 4096, nullptr, 3, nullptr, 0);
   rgbLedWrite(14, 0, 0, 0);  // LED apagado = desarmado
   if (g_lcdOk) uiInit();     // LVGL listo pero sin correr: la pantalla queda apagada hasta la combinación
+  g_lastInputMs = millis();  // arranca el contador de inactividad del auto-sleep desde el boot
 }
 
 void loop() {
@@ -1600,4 +1748,5 @@ void loop() {
   }
   pollGestures();  // encoder + botones + máquina de gestos + feedback (no bloquea; la TX va en su tarea)
   pollUi();        // menú LVGL: solo con la pantalla encendida y el RF libre
+  maybeSleep();    // fases 3/4: desarmado+inactivo → light sleep y, más tarde, deep sleep
 }
