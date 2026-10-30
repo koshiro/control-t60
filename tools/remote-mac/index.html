@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control T60 — botón remoto</title>
+<style>
+  :root { --bg:#101214; --fg:#e8eaed; --mut:#8b9199; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --line:#2a2e33; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
+         font:16px/1.4 -apple-system, system-ui, sans-serif; }
+  main { width:min(420px, 92vw); display:grid; gap:20px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  .row { display:flex; gap:10px; align-items:center; justify-content:space-between; }
+  button.conn { background:transparent; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button.conn:hover { border-color:var(--mut); }
+  #btn { width:100%; aspect-ratio:1; border-radius:50%; border:2px solid var(--line); background:#1a1d21; color:var(--fg);
+         font:600 22px/1 inherit; font-family:inherit; cursor:pointer; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #btn:disabled { opacity:.35; cursor:not-allowed; }
+  #btn.down { background:#2b3138; border-color:var(--warn); }
+  .state { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; text-align:center; }
+  .state div { border:1px solid var(--line); border-radius:8px; padding:8px 4px; }
+  .state small { display:block; color:var(--mut); font-size:12px; }
+  .state b { font-size:15px; }
+  .on { color:var(--ok); } .off { color:var(--mut); } .alert { color:var(--warn); }
+  #log { font:12px/1.5 ui-monospace, Menlo, monospace; color:var(--mut); height:96px; overflow:auto; border-top:1px solid var(--line); padding-top:8px; }
+  p.hint { color:var(--mut); font-size:13px; margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <div class="row">
+    <h1>Control T60 — botón remoto</h1>
+    <button class="conn" id="conn">Conectar</button>
+  </div>
+  <button id="btn" disabled>Mantén para apretar</button>
+  <p class="hint">1 toque: bajo · 2 toques: alto · 3 o más: rampa (un toque por pulso). La barra espaciadora también sirve. El T-Embed debe estar ARMADO (wiggle de la rueda).</p>
+  <div class="state">
+    <div><small>enlace</small><b id="sLink" class="off">—</b></div>
+    <div><small>armado</small><b id="sArm" class="off">—</b></div>
+    <div><small>shock</small><b id="sShock" class="off">—</b></div>
+    <div><small>rampa</small><b id="sRamp" class="off">—</b></div>
+  </div>
+  <div id="log"></div>
+</main>
+<script>
+const SERVICE = "6e7a0001-b5a3-f393-e0a9-e50e24dcca9e";
+const CMD     = "6e7a0002-b5a3-f393-e0a9-e50e24dcca9e";
+const STATUS  = "6e7a0003-b5a3-f393-e0a9-e50e24dcca9e";
+const $ = id => document.getElementById(id);
+let dev = null, cmd = null, pressed = false, pulses = null;
+
+function log(m) {
+  const l = $("log"), t = new Date().toLocaleTimeString("es-CL", { hour12: false });
+  l.textContent += `${t}  ${m}\n`;
+  l.scrollTop = l.scrollHeight;
+}
+function setState(el, text, cls) { el.textContent = text; el.className = cls; }
+
+async function send(v) {
+  if (!cmd) return;
+  try { await cmd.writeValueWithoutResponse(Uint8Array.of(v)); }
+  catch (e) { log("error al escribir: " + e.message); }
+}
+function down() { if (!cmd || pressed) return; pressed = true; $("btn").classList.add("down"); send(1); }
+function up()   { if (!pressed) return;       pressed = false; $("btn").classList.remove("down"); send(0); }
+
+function onStatus(ev) {
+  const v = ev.target.value; // [armado, shock, rampa, nº pulsos]
+  setState($("sArm"), v.getUint8(0) ? "sí" : "no", v.getUint8(0) ? "on" : "alert");
+  setState($("sShock"), v.getUint8(1) ? "ON" : "apagado", v.getUint8(1) ? "alert" : "off");
+  setState($("sRamp"), String(v.getUint8(2)), "off");
+  const n = v.getUint8(3);
+  if (pulses !== null && n !== pulses) log(`el T-Embed emitió un pulso (total ${n})`);
+  pulses = n;
+}
+function onDisconnect() {
+  cmd = null; pressed = false; pulses = null;
+  $("btn").disabled = true; $("btn").classList.remove("down");
+  $("conn").textContent = "Conectar";
+  setState($("sLink"), "sin enlace", "off");
+  for (const id of ["sArm", "sShock", "sRamp"]) setState($(id), "—", "off");
+  log("desconectado");
+}
+
+async function connect() {
+  if (dev && dev.gatt.connected) { dev.gatt.disconnect(); return; }
+  try {
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    dev.addEventListener("gattserverdisconnected", onDisconnect);
+    log("conectando a " + (dev.name || "dispositivo") + " (el Mac pedirá el PIN la primera vez)");
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SERVICE);
+    cmd = await svc.getCharacteristic(CMD);
+    const st = await svc.getCharacteristic(STATUS);
+    st.addEventListener("characteristicvaluechanged", onStatus);
+    await st.startNotifications();
+    onStatus({ target: { value: await st.readValue() } });
+    $("btn").disabled = false;
+    $("conn").textContent = "Desconectar";
+    setState($("sLink"), "ok", "on");
+    log("listo");
+  } catch (e) { log("no se pudo conectar: " + e.message); if (dev && dev.gatt.connected) dev.gatt.disconnect(); }
+}
+
+$("conn").addEventListener("click", connect);
+const b = $("btn");
+b.addEventListener("pointerdown", e => { b.setPointerCapture(e.pointerId); down(); });
+for (const t of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(t, up);
+addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat) { e.preventDefault(); down(); } });
+addEventListener("keyup", e => { if (e.code === "Space") { e.preventDefault(); up(); } });
+addEventListener("blur", up);
+document.addEventListener("visibilitychange", () => { if (document.hidden) up(); });
+if (!navigator.bluetooth) { log("Este navegador no tiene Web Bluetooth: usa Chrome o Edge en localhost."); $("conn").disabled = true; }
+</script>
+</body>
+</html>

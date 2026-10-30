@@ -35,6 +35,7 @@
 #include <Preferences.h>
 #include <lvgl.h>
 #include "t60frame.h"
+#include "remote_ble.h"  // botón remoto por BLE (NimBLE): solo encola flancos; la máquina de gestos decide
 
 #ifndef FW_VERSION
 #define FW_VERSION "sin-version"  // lo define tools/build_env.py (git describe)
@@ -698,6 +699,7 @@ static void cmdLcd();
 static void cmdMenu(int argc, char **argv);
 static void cmdNvs(int argc, char **argv);
 static void cmdShock(int argc, char **argv);
+static void cmdBle(int argc, char **argv);
 static void pollCombo(uint32_t now);
 
 static void handle(char *line) {
@@ -722,8 +724,9 @@ static void handle(char *line) {
   else if (!strcmp(argv[0], "menu")) cmdMenu(argc, argv);
   else if (!strcmp(argv[0], "nvs")) cmdNvs(argc, argv);
   else if (!strcmp(argv[0], "shock")) cmdShock(argc, argv);
+  else if (!strcmp(argv[0], "ble")) cmdBle(argc, argv);
   else if (!strcmp(argv[0], "beep")) { beep(argc > 1 ? atoi(argv[1]) : 1800, argc > 2 ? atoi(argv[2]) : 150); Serial.println("BEEP"); }
-  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock beep");
+  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock ble beep");
 }
 
 // ================================================================ Fase 5: control por gestos
@@ -952,6 +955,24 @@ static void beep(int freq, int ms) {
   i2s_channel_disable(g_i2s);
 }
 
+// --- botón remoto (BLE): los flancos llegan encolados desde la tarea de NimBLE y se alimentan aquí, en loop() ---
+static void pollRemote(uint32_t now) {
+  uint8_t ev;
+  while (remote::pop(ev)) {
+    if (g_inMenu) continue;  // menú abierto: la máquina no recibe eventos (el remoto tampoco)
+    if (ev == remote::Lost) {
+      g_m.remoteLost();  // enlace caído: descarta taps pendientes y corta una rampa remota; NO desarma
+      xQueueReset(g_txQueue);
+      logAdd('I', 0xFE, 0, 0);
+      continue;
+    }
+    In in = ev == remote::Down ? In::RemoteDown : In::RemoteUp;
+    logAdd('I', (uint8_t)in, 0, 0);
+    dispatch(g_actBuf, g_m.feed(in, 0, now, g_actBuf, 16));
+  }
+  remote::publish(g_m.armed(), shockEnabled(), g_m.rampLevel(), (uint8_t)g_lastN);
+}
+
 static void pollGestures() {
   static bool prevActive = false;
   static bool prevArmed = false;
@@ -959,6 +980,7 @@ static void pollGestures() {
   pollEncoder(now);
   pollBtn(g_btnEnc, In::BtnDown, In::BtnUp, now);
   pollBtn(g_btnKey, In::KeyDown, In::KeyUp, now);
+  pollRemote(now);  // botón remoto (BLE): flancos encolados por NimBLE → misma máquina de gestos
   pollCombo(now);  // KEY + botón mantenidos (desarmado) → enciende la pantalla y abre el menú
   dispatch(g_actBuf, g_m.tick(now, g_actBuf, 16));
   bool active = g_m.pressActive();
@@ -1433,6 +1455,16 @@ static void cmdMenu(int argc, char **argv) {
 // Interruptor de shock (solo por serial, a propósito fuera de la GUI). `shock` = estado, `shock on|off`.
 // Encender: tres beeps agudos locales; apagar: uno grave y se vacía la cola de TX (no sale un shock ya encolado).
 // Se guarda en NVS en el momento (persiste entre arranques; `nvs clear` lo deja apagado).
+static void cmdBle(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "clear")) {
+    remote::clearBonds();
+    Serial.println("BLE emparejamientos borrados");
+    return;
+  }
+  Serial.printf("BLE %s, emparejados=%d (ble clear = olvidar todos)\n", remote::connected() ? "conectado" : "sin enlace",
+                remote::bondCount());
+}
+
 static void cmdShock(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "on")) {
     if (!ALLOW_SHOCK) { Serial.println("ERR compilado con ALLOW_SHOCK=0: el interruptor no puede encenderse"); return; }
@@ -1582,6 +1614,7 @@ void setup() {
   audioInit();  // parlante para beeps locales (confirmación de armado); nunca estimula el collar
   xTaskCreatePinnedToCore(txTask, "t60tx", 4096, nullptr, 3, nullptr, 0);
   rgbLedWrite(14, 0, 0, 0);  // LED apagado = desarmado
+  remote::begin("T60 control", BLE_PIN);
   if (g_lcdOk) uiInit();     // LVGL listo pero sin correr: la pantalla queda apagada hasta la combinación
 }
 

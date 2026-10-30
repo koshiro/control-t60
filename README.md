@@ -92,3 +92,10 @@ versión vieja.
 ## Licencia
 
 [MIT](LICENSE) © 2026 Daniel Riquelme
+
+## Botón remoto BLE (un solo botón de emergencia)
+
+El T-Embed expone un servidor BLE cifrado (NimBLE, passkey `BLE_PIN` de `.env`). Un botón remoto manda solo flancos
+(apretado/suelto) y la máquina de gestos decide: **1 toque = shock/vibrar bajo, 2 = alto, 3+ = rampa** (un toque por
+pulso). No arma ni desarma (eso sigue siendo el wiggle de la rueda); si el enlace cae se descartan los toques
+pendientes. Pruebas desde el Mac: `tools/remote-mac/README.md`. Serial: `ble` (estado), `ble clear` (olvidar emparejados).
