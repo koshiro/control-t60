@@ -1013,6 +1013,8 @@ static void pollRemote(uint32_t now) {
   remote::publish(g_m.armed(), shockEnabled(), g_m.rampLevel(), (uint8_t)g_lastN);
 }
 
+static void pollPairing();  // definido con la pantalla (LCD/menú), más abajo
+
 static void pollGestures() {
   static bool prevActive = false;
   static bool prevArmed = false;
@@ -1020,6 +1022,7 @@ static void pollGestures() {
   pollEncoder(now);
   pollBtn(g_btnEnc, In::BtnDown, In::BtnUp, now);
   pollBtn(g_btnKey, In::KeyDown, In::KeyUp, now);
+  pollPairing();    // PIN dinámico del emparejamiento en pantalla
   pollRemote(now);  // botón remoto (BLE): flancos encolados por NimBLE → misma máquina de gestos
   pollCombo(now);  // KEY + botón mantenidos (desarmado) → enciende la pantalla y abre el menú
   dispatch(g_actBuf, g_m.tick(now, g_actBuf, 16));
@@ -1474,6 +1477,48 @@ static void pollCombo(uint32_t now) {
   }
 }
 
+// --- emparejamiento BLE: PIN aleatorio mostrado en la pantalla del T-Embed (se apaga al terminar o a los 60 s) ---
+static bool g_pairShown;
+static uint32_t g_pairMs;
+static void pairScreenOff() {
+  if (!g_pairShown) return;
+  g_pairShown = false;
+  lcdLockWait();
+  digitalWrite(PIN_LCD_BL, LOW);
+  g_lcd.sleep();
+  lcdUnlock();
+}
+static void pollPairing() {
+  uint32_t pin = 0;
+  uint8_t ev = remote::takePairEvent(pin);
+  if (ev == 1 && g_lcdOk) {
+    if (g_inMenu) menuClose(false);  // el menú usa la pantalla (LVGL): salir antes de dibujar el PIN
+    lcdLockWait();
+    g_lcd.wakeup();
+    g_lcd.fillScreen(TFT_BLACK);
+    g_lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    g_lcd.setTextDatum(textdatum_t::middle_center);
+    g_lcd.setFont(&lgfx::fonts::Font4);
+    g_lcd.drawString("Emparejar BLE", g_lcd.width() / 2, 28);
+    char buf[8];
+    snprintf(buf, sizeof buf, "%06u", (unsigned)pin);
+    g_lcd.setFont(&lgfx::fonts::Font7);
+    g_lcd.drawString(buf, g_lcd.width() / 2, g_lcd.height() / 2 + 8);
+    g_lcd.setFont(&lgfx::fonts::Font2);
+    g_lcd.drawString("escribe este PIN en el Mac", g_lcd.width() / 2, g_lcd.height() - 16);
+    digitalWrite(PIN_LCD_BL, HIGH);
+    lcdUnlock();
+    g_pairShown = true;
+    g_pairMs = millis();
+    g_lastInputMs = millis();  // no dormir mientras se empareja
+    beep(1200, 60);
+    logAdd('P', 1, 0, 0);
+  } else if (ev == 2) {
+    pairScreenOff();
+  }
+  if (g_pairShown && millis() - g_pairMs > 60000) pairScreenOff();
+}
+
 static void pollUi() {
   if (!g_inMenu) return;  // pantalla apagada: LVGL ni corre
   if (g_menuReq != REQ_NONE) {
@@ -1681,6 +1726,7 @@ static void gpioWakeArm() {
 }
 
 static void enterLightSleep(uint32_t timerMs) {
+  remote::end();  // el controlador BLE no sobrevive al light sleep: se apaga y se vuelve a levantar al despertar
   gpioWakeArm();
   if (timerMs) esp_sleep_enable_timer_wakeup((uint64_t)timerMs * 1000);  // para escalar a deep sin más input
   esp_light_sleep_start();
@@ -1689,6 +1735,7 @@ static void enterLightSleep(uint32_t timerMs) {
   if (g_pcnt) { pcnt_unit_clear_count(g_pcnt); g_lastCount = 0; }
   g_m.reset(g_cfg5, micros());
   g_lastInputMs = millis();
+  remote::begin("T60 control");
 }
 
 static void enterDeepSleep() {
@@ -1707,6 +1754,7 @@ static void enterDeepSleep() {
 static void maybeSleep() {
   if (!g_autoSleep || g_inMenu || g_m.armed() || g_m.pressActive()) return;
   if (uxQueueMessagesWaiting(g_txQueue)) return;  // hay pulsos por salir
+  if (remote::connected() || g_pairShown) return;  // enlace BLE activo o emparejando: no dormir
   if (Serial) return;                             // USB conectado (banco/cargando): no dormir, mantener serial
   uint32_t idle = millis() - g_lastInputMs;
   if (idle < T1_LIGHT_MS) return;
@@ -1797,7 +1845,7 @@ void setup() {
   g_gaugeOk = g_gauge.begin();  // I2C del fuel-gauge BQ27220 (SDA=8/SCL=18); medición de batería por `pwr`
   xTaskCreatePinnedToCore(txTask, "t60tx", 4096, nullptr, 3, nullptr, 0);
   rgbLedWrite(14, 0, 0, 0);  // LED apagado = desarmado
-  remote::begin("T60 control", BLE_PIN);
+  remote::begin("T60 control");
   if (g_lcdOk) uiInit();     // LVGL listo pero sin correr: la pantalla queda apagada hasta la combinación
   g_lastInputMs = millis();  // arranca el contador de inactividad del auto-sleep desde el boot
 }

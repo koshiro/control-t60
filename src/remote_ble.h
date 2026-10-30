@@ -1,8 +1,9 @@
 // Servidor BLE del botón remoto (un solo botón de emergencia). El remoto NO decide nada: manda flancos del botón
 // (1 = apretado, 0 = suelto) y la máquina de gestos del T-Embed (gesture::Machine, In::RemoteDown/RemoteUp) los
 // interpreta con SU reloj: 1 tap = BAJO, 2 = ALTO, 3+ = rampa. Armar/desarmar sigue siendo local (wiggle de la rueda).
-// Seguridad: el enlace va cifrado y autenticado (LE Secure Connections + passkey fija BLE_PIN de `.env`, bonding);
-// las características exigen cifrado, así que sin emparejar no se puede ni escribir ni leer el estado.
+// Seguridad: el enlace va cifrado y autenticado (LE Secure Connections + passkey DINÁMICA, bonding). Cada emparejamiento
+// genera un PIN aleatorio de 6 dígitos que el firmware muestra en la pantalla del T-Embed (takePairEvent); no hay PIN
+// guardado en ningún lado. Las características exigen cifrado, así que sin emparejar no se puede ni escribir ni leer.
 // Las callbacks corren en la tarea del host NimBLE: SOLO encolan; el loop() alimenta la máquina (no es thread-safe).
 #pragma once
 #include <NimBLEDevice.h>
@@ -21,6 +22,8 @@ static QueueHandle_t g_q;
 static NimBLEServer *g_srv;
 static NimBLECharacteristic *g_status;
 static volatile bool g_conn;
+static volatile uint32_t g_pin;     // PIN del emparejamiento en curso
+static volatile uint8_t g_pairEv;   // 0 nada · 1 mostrar PIN · 2 emparejamiento terminado (ocultar)
 
 static void push(uint8_t ev) {
   if (g_q) xQueueSend(g_q, &ev, 0);
@@ -33,10 +36,17 @@ class SrvCb : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
     g_conn = false;
+    g_pairEv = 2;  // si había un PIN en pantalla, ocultarlo
     push(Lost);
     NimBLEDevice::startAdvertising();
   }
+  uint32_t onPassKeyDisplay() override {  // el host pide el PIN a mostrar: uno nuevo por emparejamiento
+    g_pin = esp_random() % 1000000;
+    g_pairEv = 1;
+    return g_pin;
+  }
   void onAuthenticationComplete(NimBLEConnInfo &ci) override {
+    g_pairEv = 2;
     if (!ci.isEncrypted() || !ci.isAuthenticated()) NimBLEDevice::getServer()->disconnect(ci.getConnHandle());
   }
 };
@@ -53,12 +63,13 @@ class CmdCb : public NimBLECharacteristicCallbacks {
 static SrvCb g_srvCb;
 static CmdCb g_cmdCb;
 
-inline void begin(const char *name, uint32_t pin) {
-  g_q = xQueueCreate(16, sizeof(uint8_t));
+inline void begin(const char *name) {
+  if (!g_q) g_q = xQueueCreate(16, sizeof(uint8_t));
+  g_conn = false;
+  g_pairEv = 0;
   NimBLEDevice::init(name);
   NimBLEDevice::setSecurityAuth(true, true, true);  // bonding + MITM + Secure Connections
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-  NimBLEDevice::setSecurityPasskey(pin);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);  // sin passkey estática: el PIN sale de onPassKeyDisplay
   g_srv = NimBLEDevice::createServer();
   g_srv->setCallbacks(&g_srvCb);
   NimBLEService *svc = g_srv->createService(kService);
@@ -76,7 +87,22 @@ inline void begin(const char *name, uint32_t pin) {
   adv->start();
 }
 
+// Apagar el BLE entero (antes de un light sleep: el controlador no sobrevive dormido). Los emparejados quedan en NVS.
+inline void end() {
+  NimBLEDevice::deinit(true);
+  g_srv = nullptr;
+  g_status = nullptr;
+  g_conn = false;
+  g_pairEv = 0;
+}
+
 inline bool connected() { return g_conn; }
+// Evento de emparejamiento para la pantalla: devuelve 1 (mostrar `pin`), 2 (ocultar) o 0; lo consume.
+inline uint8_t takePairEvent(uint32_t &pin) {
+  uint8_t e = g_pairEv;
+  if (e) { pin = g_pin; g_pairEv = 0; }
+  return e;
+}
 inline bool pop(uint8_t &ev) { return g_q && xQueueReceive(g_q, &ev, 0) == pdTRUE; }
 
 // Estado para la app (se notifica solo si cambió).

@@ -88,7 +88,7 @@ async function connect() {
   try {
     dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
     dev.addEventListener("gattserverdisconnected", onDisconnect);
-    log("conectando a " + (dev.name || "dispositivo") + " (el Mac pedirá el PIN la primera vez)");
+    log("conectando a " + (dev.name || "dispositivo") + " (la primera vez el Mac pide el PIN que muestra el T-Embed)");
     const srv = await dev.gatt.connect();
     const svc = await srv.getPrimaryService(SERVICE);
     cmd = await svc.getCharacteristic(CMD);

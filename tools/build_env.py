@@ -1,6 +1,5 @@
 # Script `pre:` de PlatformIO para el firmware (env tembed):
-#   1. T60_ID y BLE_PIN desde `.env` (no versionado): el ID del collar y el PIN del botón remoto BLE no quedan en el
-#      repositorio. Formato T60_ID=0x1234 y BLE_PIN=123456 (6 dígitos; el Mac lo pide al emparejar).
+#   1. T60_ID desde `.env` (no versionado): el ID del collar no queda en el repositorio. Formato T60_ID=0x1234.
 #   2. FW_VERSION = `git describe --always --dirty` grabado en el firmware (`ver` / `ping`): permite comparar lo
 #      que corre en el T-Embed con el repo.
 #   3. Se niega a compilar si este checkout está ATRASADO respecto de su upstream (origin/main), tras un
@@ -25,21 +24,14 @@ def git(*args, timeout=5):
 # --- 1. ID del collar ---
 path = os.path.join(proj, ".env")
 val = None
-pin = None
 if os.path.isfile(path):
     with open(path) as f:
         for line in f:
             m = re.match(r"\s*T60_ID\s*=\s*(0x[0-9A-Fa-f]{4})\s*(#.*)?$", line)
             if m:
                 val = m.group(1)
-            m = re.match(r"\s*BLE_PIN\s*=\s*([0-9]{6})\s*(#.*)?$", line)
-            if m:
-                pin = m.group(1)
 if not val:
     print(f"\nERROR: falta T60_ID en {path} (copiá .env.example a .env y poné el ID de tu collar)\n")
-    env.Exit(1)  # noqa: F821
-if not pin:
-    print(f"\nERROR: falta BLE_PIN (6 dígitos) en {path} (ver .env.example): es el PIN del botón remoto BLE\n")
     env.Exit(1)  # noqa: F821
 
 # --- 3. no compilar una versión atrasada ---
@@ -54,5 +46,5 @@ elif int(behind) > 0:
 
 # --- 2. versión ---
 ver = git("describe", "--always", "--dirty", "--abbrev=7") or "sin-git"
-env.Append(CPPDEFINES=[("T60_ID", val), ("BLE_PIN", pin), ("FW_VERSION", env.StringifyMacro(ver))])  # noqa: F821
-print(f"control-t60: T60_ID y BLE_PIN desde .env, versión {ver}")
+env.Append(CPPDEFINES=[("T60_ID", val),  ("FW_VERSION", env.StringifyMacro(ver))])  # noqa: F821
+print(f"control-t60: T60_ID desde .env, versión {ver}")

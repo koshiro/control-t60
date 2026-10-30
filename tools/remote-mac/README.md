@@ -7,7 +7,7 @@ python3 -m http.server 8765 --directory tools/remote-mac   # y abrir http://loca
 ```
 
 1. En el T-Embed: armar con el wiggle de la rueda (el remoto no arma).
-2. **Conectar** → elegir "T60 control". La primera vez macOS pide el PIN de 6 dígitos (`BLE_PIN` del `.env`).
+2. **Conectar** → elegir "T60 control". La primera vez macOS pide un PIN de 6 dígitos: **aparece en la pantalla del T-Embed** (es nuevo en cada emparejamiento).
 3. Mantener el botón (o la barra espaciadora): 1 toque = bajo, 2 = alto, 3+ = rampa.
 
 Protocolo GATT (servicio `6e7a0001-b5a3-f393-e0a9-e50e24dcca9e`, todo cifrado):
