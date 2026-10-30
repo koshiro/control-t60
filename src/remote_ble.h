@@ -31,6 +31,11 @@ static volatile uint32_t g_pin;     // PIN del emparejamiento en curso
 static volatile uint8_t g_pairEv;   // 0 nada · 1 mostrar PIN · 2 emparejamiento terminado (ocultar)
 static bool g_initOk;               // diagnóstico (`ble`)
 static uint32_t g_heapBefore, g_heapAfter;
+// Diagnóstico del enlace (se muestra con `ble`): contadores y razón de la última desconexión (códigos NimBLE: 0x200 + HCI;
+// 0x208 = supervision timeout, 0x213 = el Mac cortó, 0x216 = corte local, 0x23D = fallo de MIC).
+static volatile uint32_t g_nConn, g_nDisc, g_lastReason, g_lastLinkMs, g_advRestarts, g_connAt;
+static volatile int g_lastEnc = -1;
+static volatile uint32_t g_authFail, g_wRejected;  // fallos de cifrado vistos · escrituras rechazadas por enlace no seguro
 
 static void push(uint8_t ev) {
   if (g_q) xQueueSend(g_q, &ev, 0);
@@ -55,19 +60,41 @@ class SecCb : public BLESecurityCallbacks {
     g_pairEv = 1;
   }
   bool onSecurityRequest() override { return true; }
-  void onAuthenticationComplete(ble_gap_conn_desc *d, int status) override {
+  // Se llama en CADA evento de cifrado, también los fallidos (p. ej. BLE_HS_ETIMEOUT a los 30 s del SMP). NO se corta el
+  // enlace aquí: medido 2026-10-30, cortar en ese timeout tiraba un enlace que ya funcionaba (razón 0x216 a los 30 s).
+  // La seguridad la imponen los permisos ENC+AUTHEN de las características y el chequeo de onWrite.
+  void onAuthenticationComplete(ble_gap_conn_desc *, int status) override {
     g_pairEv = 2;
-    if (status != 0 || !d->sec_state.encrypted || !d->sec_state.authenticated) g_srv->disconnect(d->conn_handle);
+    if (status != 0) g_authFail++;
   }
 };
 
 class CmdCb : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c, ble_gap_conn_desc *) override {
+  void onWrite(BLECharacteristic *c, ble_gap_conn_desc *d) override {
+    if (!d->sec_state.encrypted || !d->sec_state.authenticated) { g_wRejected++; return; }  // defensa en profundidad
     if (c->getLength() < 1) return;
     uint8_t b = c->getData()[0];
     if (b == 0 || b == 1) push(b);  // cualquier otro byte se ignora
   }
 };
+
+static int gapDiag(struct ble_gap_event *e, void *) {
+  switch (e->type) {
+    case BLE_GAP_EVENT_CONNECT:
+      if (e->connect.status == 0) { g_nConn++; g_connAt = millis(); }
+      break;
+    case BLE_GAP_EVENT_DISCONNECT:
+      g_nDisc++;
+      g_lastReason = e->disconnect.reason;
+      g_lastLinkMs = millis() - g_connAt;
+      break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+      g_lastEnc = e->enc_change.status;
+      break;
+    default: break;
+  }
+  return 0;
+}
 
 static SrvCb g_srvCb;
 static SecCb g_secCb;
@@ -85,6 +112,7 @@ inline void begin(const char *name) {
   BLESecurity::setPassKey(false);                       // aleatorio...
   BLESecurity::regenPassKeyOnConnect(true);             // ...y nuevo en cada conexión
   BLEDevice::setSecurityCallbacks(&g_secCb);
+  BLEDevice::setCustomGapHandler(gapDiag);
   g_srv = BLEDevice::createServer();
   g_srv->setCallbacks(&g_srvCb);
   BLEService *svc = g_srv->createService(kService);
@@ -114,6 +142,24 @@ inline void end() {
   g_pairEv = 0;
 }
 
+// Watchdog del anuncio: si no hay enlace y no se está anunciando, reanudar (cuenta cuántas veces hizo falta).
+inline void keepAdvertising() {
+  if (!g_srv || g_conn) return;
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  if (adv && !adv->isAdvertising()) {
+    BLEDevice::startAdvertising();
+    g_advRestarts++;
+  }
+}
+inline bool advertising() { BLEAdvertising *a = g_srv ? BLEDevice::getAdvertising() : nullptr; return a && a->isAdvertising(); }
+inline uint32_t nConn() { return g_nConn; }
+inline uint32_t nDisc() { return g_nDisc; }
+inline uint32_t lastReason() { return g_lastReason; }
+inline uint32_t lastLinkMs() { return g_lastLinkMs; }
+inline uint32_t advRestarts() { return g_advRestarts; }
+inline uint32_t authFail() { return g_authFail; }
+inline uint32_t wRejected() { return g_wRejected; }
+inline int lastEnc() { return g_lastEnc; }
 inline bool initOk() { return g_initOk; }
 inline uint32_t heapBefore() { return g_heapBefore; }
 inline uint32_t heapAfter() { return g_heapAfter; }

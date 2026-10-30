@@ -316,7 +316,7 @@ static int capture(uint32_t limitUs, uint32_t &t0) {
     uint32_t lv = gdo0Level();
     if (now - prev > g_maxSampleGap) g_maxSampleGap = now - prev;
     if (lv != last) {
-      if (n < MAX_EDGES) g_edges[n] = {prev, now};
+      if (g_edges && n < MAX_EDGES) g_edges[n] = {prev, now};  // sin buffer (RAM al BLE) solo cuenta; no escribir en NULL
       n++;
       last = lv;
     }
@@ -334,6 +334,10 @@ static void report(const t60::Run *runs, int nRuns, int nEdges, int framesSent) 
                 (unsigned)g_startLevel, g_maxSampleGap / cpm);
   if (nEdges != nRuns || nEdges > MAX_EDGES) {
     Serial.println("MEAS FAIL cantidad de flancos ≠ corridas enviadas");
+    return;
+  }
+  if (!g_edges) {  // el buffer de 64 KB no cupo en la RAM interna que dejó el BLE: solo hay conteo, sin forma de onda
+    Serial.println("MEAS sin buffer de flancos (RAM interna ocupada por el BLE): solo conteo");
     return;
   }
   auto mid = [&](int i) { return (g_edges[i].before + (g_edges[i].at - g_edges[i].before) / 2.0) / cpm; };
@@ -693,6 +697,7 @@ static void cmdCap(int argc, char **argv) {
   uint32_t secs = argc > 1 ? strtoul(argv[1], nullptr, 10) : 6;
   if (secs < 1) secs = 1;
   if (secs > 15) secs = 15;  // CCOUNT (32 bits) envuelve a ~17.9 s @240 MHz → tope 15 s
+  if (!g_enc) { Serial.println("ERR cap: sin buffer (RAM interna ocupada por el BLE)"); return; }
   const double cpm = getCpuFrequencyMhz();
   Serial.printf("CAP %u s — hacé el gesto ahora. Pines activos en bajo: A=%d B=%d BTN=%d KEY=%d\n", secs,
                 PIN_ENC_A, PIN_ENC_B, PIN_ENC_BTN, PIN_KEY);
@@ -1003,13 +1008,14 @@ static void pollRemote(uint32_t now) {
     if (ev == remote::Lost) {
       g_m.remoteLost();  // enlace caído: descarta taps pendientes y corta una rampa remota; NO desarma
       xQueueReset(g_txQueue);
-      logAdd('I', 0xFE, 0, 0);
+      logAdd('I', 0xFE, (uint8_t)(remote::lastReason() & 0xFF), (uint8_t)(remote::lastLinkMs() / 1000));
       continue;
     }
     In in = ev == remote::Down ? In::RemoteDown : In::RemoteUp;
     logAdd('I', (uint8_t)in, 0, 0);
     dispatch(g_actBuf, g_m.feed(in, 0, now, g_actBuf, 16));
   }
+  remote::keepAdvertising();
   remote::publish(g_m.armed(), shockEnabled(), g_m.rampLevel(), (uint8_t)g_lastN);
 }
 
@@ -1565,7 +1571,12 @@ static void cmdBle(int argc, char **argv) {
   Serial.printf("BLE %s %s, emparejados=%d (ble clear = olvidar todos); heap interno libre=%u mayor bloque=%u\n",
                 remote::started() ? "iniciado" : (remote::initOk() ? "NO INICIADO (init ok)" : "NO INICIADO (init falló)"), remote::connected() ? "conectado" : "sin enlace", remote::bondCount(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-  Serial.printf("  mayor bloque antes/después de iniciar BLE: %u / %u\n", (unsigned)remote::heapBefore(), (unsigned)remote::heapAfter());
+  Serial.printf("  enlace: anunciando=%d conexiones=%u desconexiones=%u última razón=0x%X (duró %u ms) enc=%d reinicios de anuncio=%u fallos de cifrado=%u escrituras rechazadas=%u\n",
+                remote::advertising(), (unsigned)remote::nConn(), (unsigned)remote::nDisc(), (unsigned)remote::lastReason(),
+                (unsigned)remote::lastLinkMs(), remote::lastEnc(), (unsigned)remote::advRestarts(), (unsigned)remote::authFail(),
+                (unsigned)remote::wRejected());
+  Serial.printf("  mayor bloque antes/después de iniciar BLE: %u / %u; buffers de banco: flancos=%s cap=%s\n",
+                (unsigned)remote::heapBefore(), (unsigned)remote::heapAfter(), g_edges ? "ok" : "sin RAM", g_enc ? "ok" : "sin RAM");
 }
 
 static void cmdShock(int argc, char **argv) {
