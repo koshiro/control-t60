@@ -1562,8 +1562,10 @@ static void cmdBle(int argc, char **argv) {
     Serial.println("BLE emparejamientos borrados");
     return;
   }
-  Serial.printf("BLE %s, emparejados=%d (ble clear = olvidar todos)\n", remote::connected() ? "conectado" : "sin enlace",
-                remote::bondCount());
+  Serial.printf("BLE %s %s, emparejados=%d (ble clear = olvidar todos); heap interno libre=%u mayor bloque=%u\n",
+                remote::started() ? "iniciado" : (remote::initOk() ? "NO INICIADO (init ok)" : "NO INICIADO (init falló)"), remote::connected() ? "conectado" : "sin enlace", remote::bondCount(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  Serial.printf("  mayor bloque antes/después de iniciar BLE: %u / %u\n", (unsigned)remote::heapBefore(), (unsigned)remote::heapAfter());
 }
 
 static void cmdShock(int argc, char **argv) {
@@ -1800,6 +1802,10 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(100);
 
+  // BLE PRIMERO: el controlador necesita un bloque grande de RAM interna; si se levanta tras las asignaciones de
+  // TX/pantalla (heap ya fragmentado) corrompe el heap (bucle de arranque medido 2026-10-30).
+  remote::begin("T60 control");
+
   // Fase 1 (power): correr a 80 MHz en vez de 240 → ~2× autonomía armado. El APB queda fijo en 80 MHz para
   // CPU ≥ 80, así que RMT/PCNT/I2S/USB-CDC no cambian y la trama de 104.2 µs NO se mueve. 80 MHz es el piso:
   // por debajo el APB seguiría al CPU y rompería el timing de la TX. Se sube a 240 solo alrededor del
@@ -1845,7 +1851,6 @@ void setup() {
   g_gaugeOk = g_gauge.begin();  // I2C del fuel-gauge BQ27220 (SDA=8/SCL=18); medición de batería por `pwr`
   xTaskCreatePinnedToCore(txTask, "t60tx", 4096, nullptr, 3, nullptr, 0);
   rgbLedWrite(14, 0, 0, 0);  // LED apagado = desarmado
-  remote::begin("T60 control");
   if (g_lcdOk) uiInit();     // LVGL listo pero sin correr: la pantalla queda apagada hasta la combinación
   g_lastInputMs = millis();  // arranca el contador de inactividad del auto-sleep desde el boot
 }

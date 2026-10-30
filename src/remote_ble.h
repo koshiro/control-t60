@@ -4,11 +4,16 @@
 // Seguridad: el enlace va cifrado y autenticado (LE Secure Connections + passkey DINÁMICA, bonding). Cada emparejamiento
 // genera un PIN aleatorio de 6 dígitos que el firmware muestra en la pantalla del T-Embed (takePairEvent); no hay PIN
 // guardado en ningún lado. Las características exigen cifrado, así que sin emparejar no se puede ni escribir ni leer.
+// BLE nativo del core Arduino-ESP32 (NimBLE integrado; NO usar NimBLE-Arduino: duplica el host y corrompe la RAM).
 // Las callbacks corren en la tarea del host NimBLE: SOLO encolan; el loop() alimenta la máquina (no es thread-safe).
 #pragma once
-#include <NimBLEDevice.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <host/ble_store.h>
 
 namespace remote {
 
@@ -19,83 +24,100 @@ static constexpr const char *kStatusChar = "6e7a0003-b5a3-f393-e0a9-e50e24dcca9e
 enum Ev : uint8_t { Up = 0, Down = 1, Lost = 0xFE };  // Lost: el enlace cayó (descartar taps pendientes)
 
 static QueueHandle_t g_q;
-static NimBLEServer *g_srv;
-static NimBLECharacteristic *g_status;
+static BLEServer *g_srv;
+static BLECharacteristic *g_status;
 static volatile bool g_conn;
 static volatile uint32_t g_pin;     // PIN del emparejamiento en curso
 static volatile uint8_t g_pairEv;   // 0 nada · 1 mostrar PIN · 2 emparejamiento terminado (ocultar)
+static bool g_initOk;               // diagnóstico (`ble`)
+static uint32_t g_heapBefore, g_heapAfter;
 
 static void push(uint8_t ev) {
   if (g_q) xQueueSend(g_q, &ev, 0);
 }
 
-class SrvCb : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer *s, NimBLEConnInfo &ci) override {
+class SrvCb : public BLEServerCallbacks {
+  void onConnect(BLEServer *s, ble_gap_conn_desc *d) override {
     g_conn = true;
-    s->updateConnParams(ci.getConnHandle(), 12, 24, 0, 400);  // 15–30 ms, sin latencia, timeout 4 s: respuesta ágil
+    s->updateConnParams(d->conn_handle, 12, 24, 0, 400);  // 15–30 ms, sin latencia, timeout 4 s: respuesta ágil
   }
-  void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
+  void onDisconnect(BLEServer *, ble_gap_conn_desc *) override {
     g_conn = false;
     g_pairEv = 2;  // si había un PIN en pantalla, ocultarlo
     push(Lost);
-    NimBLEDevice::startAdvertising();
-  }
-  uint32_t onPassKeyDisplay() override {  // el host pide el PIN a mostrar: uno nuevo por emparejamiento
-    g_pin = esp_random() % 1000000;
-    g_pairEv = 1;
-    return g_pin;
-  }
-  void onAuthenticationComplete(NimBLEConnInfo &ci) override {
-    g_pairEv = 2;
-    if (!ci.isEncrypted() || !ci.isAuthenticated()) NimBLEDevice::getServer()->disconnect(ci.getConnHandle());
+    BLEDevice::startAdvertising();
   }
 };
 
-class CmdCb : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
-    NimBLEAttValue v = c->getValue();
-    if (v.size() < 1) return;
-    uint8_t b = v.data()[0];
+class SecCb : public BLESecurityCallbacks {
+  void onPassKeyNotify(uint32_t k) override {  // PIN aleatorio nuevo por emparejamiento: mostrarlo en la pantalla
+    g_pin = k;
+    g_pairEv = 1;
+  }
+  bool onSecurityRequest() override { return true; }
+  void onAuthenticationComplete(ble_gap_conn_desc *d, int status) override {
+    g_pairEv = 2;
+    if (status != 0 || !d->sec_state.encrypted || !d->sec_state.authenticated) g_srv->disconnect(d->conn_handle);
+  }
+};
+
+class CmdCb : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c, ble_gap_conn_desc *) override {
+    if (c->getLength() < 1) return;
+    uint8_t b = c->getData()[0];
     if (b == 0 || b == 1) push(b);  // cualquier otro byte se ignora
   }
 };
 
 static SrvCb g_srvCb;
+static SecCb g_secCb;
 static CmdCb g_cmdCb;
 
 inline void begin(const char *name) {
   if (!g_q) g_q = xQueueCreate(16, sizeof(uint8_t));
   g_conn = false;
   g_pairEv = 0;
-  NimBLEDevice::init(name);
-  NimBLEDevice::setSecurityAuth(true, true, true);  // bonding + MITM + Secure Connections
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);  // sin passkey estática: el PIN sale de onPassKeyDisplay
-  g_srv = NimBLEDevice::createServer();
+  g_heapBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  BLEDevice::init(name);
+  g_initOk = true;
+  BLESecurity::setAuthenticationMode(true, true, true);  // bonding + MITM + Secure Connections
+  BLESecurity::setCapability(ESP_IO_CAP_OUT);           // solo pantalla: el PIN se muestra aquí y se teclea en el Mac
+  BLESecurity::setPassKey(false);                       // aleatorio...
+  BLESecurity::regenPassKeyOnConnect(true);             // ...y nuevo en cada conexión
+  BLEDevice::setSecurityCallbacks(&g_secCb);
+  g_srv = BLEDevice::createServer();
   g_srv->setCallbacks(&g_srvCb);
-  NimBLEService *svc = g_srv->createService(kService);
-  NimBLECharacteristic *cmd = svc->createCharacteristic(
-      kCmdChar, NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
+  BLEService *svc = g_srv->createService(kService);
+  BLECharacteristic *cmd = svc->createCharacteristic(
+      kCmdChar, BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_ENC |
+                    BLECharacteristic::PROPERTY_WRITE_AUTHEN);
   cmd->setCallbacks(&g_cmdCb);
   g_status = svc->createCharacteristic(
-      kStatusChar, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
+      kStatusChar, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ_ENC |
+                       BLECharacteristic::PROPERTY_READ_AUTHEN);
   uint8_t zero[4] = {0, 0, 0, 0};
   g_status->setValue(zero, sizeof zero);
   svc->start();
-  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(kService);
-  adv->setName(name);
-  adv->start();
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  g_heapAfter = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
 }
 
 // Apagar el BLE entero (antes de un light sleep: el controlador no sobrevive dormido). Los emparejados quedan en NVS.
 inline void end() {
-  NimBLEDevice::deinit(true);
+  BLEDevice::deinit(false);
   g_srv = nullptr;
   g_status = nullptr;
   g_conn = false;
   g_pairEv = 0;
 }
 
+inline bool initOk() { return g_initOk; }
+inline uint32_t heapBefore() { return g_heapBefore; }
+inline uint32_t heapAfter() { return g_heapAfter; }
+inline bool started() { return g_srv != nullptr; }
 inline bool connected() { return g_conn; }
 // Evento de emparejamiento para la pantalla: devuelve 1 (mostrar `pin`), 2 (ocultar) o 0; lo consume.
 inline uint8_t takePairEvent(uint32_t &pin) {
@@ -115,7 +137,10 @@ inline void publish(bool armed, bool shock, uint8_t ramp, uint8_t nPulses) {
   if (g_conn) g_status->notify();
 }
 
-inline void clearBonds() { NimBLEDevice::deleteAllBonds(); }
-inline int bondCount() { return NimBLEDevice::getNumBonds(); }
+inline void clearBonds() { if (g_srv) ble_store_clear(); }
+inline int bondCount() {
+  int n = 0;
+  return g_srv && ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &n) == 0 ? n : -1;  // -1: BLE apagado
+}
 
 }  // namespace remote
