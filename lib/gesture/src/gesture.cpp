@@ -57,6 +57,9 @@ void Machine::reset(const Config &c, uint32_t now) {
   ramp_ = cfg_.minRamp;
   clickCount_ = 0;
   btnDown_ = keyDown_ = tonoActive_ = doublePending_ = keyLatched_ = rampActive_ = pendingDisarm_ = grace_ = false;
+  rDown_ = rRamp_ = false;
+  rTaps_ = 0;
+  rDownUs_ = rLastUp_ = 0;
   armGraceStart_ = 0;
   revCount_ = 0;
   lastDir_ = 0;
@@ -68,6 +71,16 @@ void Machine::reset(const Config &c, uint32_t now) {
   haveStim_ = false;
   lastStimStart_ = 0;
   startCount_ = startHead_ = 0;
+}
+
+void Machine::remoteLost() {
+  rDown_ = false;
+  rTaps_ = 0;
+  if (rRamp_) {
+    rRamp_ = false;
+    rampActive_ = false;
+    ramp_ = cfg_.minRamp;
+  }
 }
 
 void Machine::push(Action *out, int maxOut, int &n, Act a, Mode m, uint8_t p) {
@@ -146,8 +159,9 @@ int Machine::feed(In in, int32_t data, uint32_t now, Action *out, int maxOut) {
         if (revCount_ >= cfg_.wiggleRevs) {
           revCount_ = 0;
           lastDir_ = dir;
-          rampActive_ = tonoActive_ = doublePending_ = false;
+          rampActive_ = tonoActive_ = doublePending_ = rRamp_ = false;
           clickCount_ = 0;
+          rTaps_ = 0;
           // NO se emite nada al collar: la confirmación de armado es un beep LOCAL del parlante del T-Embed
           // (lo hace el firmware al detectar el cambio de armed()). Aquí solo se cambia el estado.
           if (!armed_) {
@@ -179,6 +193,42 @@ int Machine::feed(In in, int32_t data, uint32_t now, Action *out, int maxOut) {
       break;
     }
 
+    case In::RemoteDown: {
+      rDown_ = true;
+      rDownUs_ = now;
+      if (!armed_ || tonoActive_) break;  // H10: desarmado no hace nada
+      if (rampActive_) {                  // sesión de rampa en curso: cada tap es una muesca
+        rampLastDetent_ = now;
+        if (tryStart(now)) {
+          ramp_ = clampPow(ramp_ + cfg_.step);
+          emitPulse(rampMode_, ramp_, out, maxOut, n);
+        }
+        break;
+      }
+      bool inWindow = rTaps_ >= 1 && (uint32_t)(now - rLastUp_) <= cfg_.doubleClickUs;
+      rTaps_ = inWindow ? (uint8_t)(rTaps_ + 1) : 1;
+      if (rTaps_ >= 3) {  // 3.º tap: arranca la rampa (el BAJO/ALTO pendiente queda cancelado)
+        rTaps_ = 0;
+        clickCount_ = 0;
+        doublePending_ = false;
+        rampActive_ = rRamp_ = true;
+        ramp_ = cfg_.minRamp;
+        rampMode_ = Mode::Shock;
+        rampLastDetent_ = now;
+        if (tryStart(now)) {
+          ramp_ = clampPow(ramp_ + cfg_.step);
+          emitPulse(rampMode_, ramp_, out, maxOut, n);
+        }
+      }
+      break;
+    }
+
+    case In::RemoteUp:
+      if (!rDown_) break;
+      rDown_ = false;
+      if (rTaps_ >= 1) rLastUp_ = now;  // la ventana para el siguiente tap corre desde que se suelta
+      break;
+
     case In::KeyDown:
       keyDown_ = true;
       keyDownUs_ = now;
@@ -206,8 +256,9 @@ int Machine::tick(uint32_t now, Action *out, int maxOut) {
   if (pendingDisarm_) {
     pendingDisarm_ = false;
     armed_ = false;
-    rampActive_ = tonoActive_ = doublePending_ = false;
+    rampActive_ = tonoActive_ = doublePending_ = rRamp_ = false;
     clickCount_ = 0;
+    rTaps_ = 0;
   }
 
   // Click simple: la ventana de doble venció sin segundo click y sin botón apretado → BAJO.
@@ -217,10 +268,27 @@ int Machine::tick(uint32_t now, Action *out, int maxOut) {
     if (tryStart(now)) emitPulse(Mode::Shock, cfg_.lowPower, out, maxOut, n);
   }
 
+  // Botón remoto atascado (el RemoteUp se perdió por el aire): tras maxRampUs se da por soltado, sin emitir.
+  if (rDown_ && (uint32_t)(now - rDownUs_) >= cfg_.maxRampUs) {
+    rDown_ = false;
+    rTaps_ = 0;
+  }
+  // Taps remotos: venció la ventana con el botón suelto → 1 tap = BAJO, 2 taps = ALTO (3+ ya arrancó la rampa).
+  if (armed_ && rTaps_ >= 1 && !rDown_ && !rampActive_ && !tonoActive_ &&
+      (uint32_t)(now - rLastUp_) > cfg_.doubleClickUs) {
+    uint8_t taps = rTaps_;
+    rTaps_ = 0;
+    if (tryStart(now)) emitPulse(Mode::Shock, taps == 1 ? cfg_.lowPower : cfg_.highPower, out, maxOut, n);
+  }
+  if (!armed_) rTaps_ = 0;
+
   // Rampa: aquí SOLO se gestiona el fin. Emitir es exclusivo del detent (feed), así que al dejar de girar no
   // sale nada más. Sin muescas por rampIdle (H3) → fin de sesión y nivel al piso, listo para la próxima.
-  if (rampActive_ && (uint32_t)(now - rampLastDetent_) >= cfg_.rampIdleUs) {
+  // La remota por taps espera más: un tap por pulso (minStimGap) + holgura, si no cada tap reiniciaría el nivel.
+  uint32_t idle = rRamp_ ? cfg_.minStimGapUs + cfg_.rampIdleUs : cfg_.rampIdleUs;
+  if (rampActive_ && (uint32_t)(now - rampLastDetent_) >= idle) {
     rampActive_ = false;
+    rRamp_ = false;
     ramp_ = cfg_.minRamp;
   }
 
@@ -242,6 +310,7 @@ int Machine::tick(uint32_t now, Action *out, int maxOut) {
     armed_ = false;
     clickCount_ = 0;
     doublePending_ = false;
+    rTaps_ = 0;
   }
   return n;
 }

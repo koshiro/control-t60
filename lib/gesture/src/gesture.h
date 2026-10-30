@@ -13,6 +13,10 @@
 //   rueda, wiggle (reversas rápidas der-izq-der-izq) -> alterna ARMADO/desarmado (la KEY es incómoda). Confirma
 //                          con sonido sin mirar: armar = beep (Tono), desarmar = buzz (Vibrar).
 //   KEY toque corto     -> Stim(Vibrar, keyVibr)  + Release
+//   BOTÓN REMOTO (BLE, un solo botón; RemoteDown/RemoteUp) -> taps contados con la ventana de doble click:
+//                          1 tap  -> Stim(Shock, BAJO) al vencer la ventana · 2 taps -> Stim(Shock, ALTO) al vencer
+//                          3+ taps -> RAMPA: cada tap desde el 3.º emite un pulso que sube PASO (arranca en MIN_RAMPA).
+//                          La sesión de rampa remota termina tras (minStimGap + rampIdle) sin taps. NO arma ni desarma.
 //   KEY mantenida       -> pulsos de Tono REPETIDOS a la cadencia mientras se mantiene (el collar no sostiene;
 //                          re-disparar es la única forma de que suene repetido). Cada pulso = Stim + Release.
 // Nada sale si no está ARMADO. Armar = mantener KEY >= armHoldUs estando DESARMADO. Desarme por inactividad.
@@ -22,7 +26,7 @@
 
 namespace gesture {
 
-enum class In : uint8_t { BtnDown, BtnUp, Wheel, KeyDown, KeyUp };  // Wheel lleva data = +1/-1 (sentido)
+enum class In : uint8_t { BtnDown, BtnUp, Wheel, KeyDown, KeyUp, RemoteDown, RemoteUp };  // Wheel lleva data = +1/-1 (sentido)
 enum class Mode : uint8_t { None, Shock, Vibrar, Tono, Luz };
 enum class Act : uint8_t { None, Stim, Release };
 
@@ -76,6 +80,8 @@ class Machine {
   bool pressActive() const { return rampActive_ || tonoActive_; }
   uint8_t rampLevel() const { return ramp_; }
   const Config &config() const { return cfg_; }
+  // El enlace BLE cayó: descarta taps pendientes y cierra una rampa remota en curso (NO toca el armado).
+  void remoteLost();
 
  private:
   bool tryStart(uint32_t now);  // puerta de ritmo (minStimGap + maxStimPerMin); registra el inicio si pasa
@@ -87,6 +93,9 @@ class Machine {
   bool armed_ = false, btnDown_ = false, keyDown_ = false, tonoActive_ = false, doublePending_ = false,
        haveStim_ = false, keyLatched_ = false, rampActive_ = false, pendingDisarm_ = false, grace_ = false;
   uint32_t armGraceStart_ = 0;
+  bool rDown_ = false, rRamp_ = false;  // botón remoto apretado · la rampa activa la inició el remoto
+  uint8_t rTaps_ = 0;                   // taps remotos contados en la ventana (1, 2; al 3.º arranca la rampa)
+  uint32_t rDownUs_ = 0, rLastUp_ = 0;
   uint8_t clickCount_ = 0, ramp_ = 0, revCount_ = 0;
   int8_t lastDir_ = 0;
   uint8_t runLen_ = 0;        // clicks seguidos en el mismo sentido (zona de seguridad)

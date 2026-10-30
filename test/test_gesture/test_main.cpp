@@ -440,7 +440,7 @@ static void test_fuzz_random_sequences() {
         int nn = m.tick(t, out, 8);
         for (int k = 0; k < nn; k++) rec.push_back({t, out[k], m.armed()});
       }
-      In in = (In)(rng() % 5);
+      In in = (In)(rng() % 7);  // incluye RemoteDown/RemoteUp
       int32_t data = (rng() & 1) ? +1 : -1;
       int nn = m.feed(in, data, t, out, 8);
       for (int k = 0; k < nn; k++) rec.push_back({t, out[k], m.armed()});
@@ -626,6 +626,120 @@ static void test_shock_switch_substitution() {
     for (bool on : {false, true}) TEST_ASSERT_EQUAL_INT((int)m, (int)effectiveMode(m, on));
 }
 
+
+// ================================ botón remoto (BLE): 1 tap BAJO · 2 taps ALTO · 3+ taps rampa ================================
+static std::vector<Rec> remoteRun(Machine &m, const std::vector<std::pair<uint32_t, bool>> &taps, bool arm = true) {
+  // taps: (instante, true=down/false=up); empieza ≥2 s tras armar
+  std::vector<Step> s;
+  for (auto &t : taps) s.push_back({t.first, t.second ? In::RemoteDown : In::RemoteUp, 0});
+  uint32_t t0 = arm ? armDirect(m) : 0;
+  std::vector<Rec> r;
+  run(m, s, r, t0);
+  return r;
+}
+static std::vector<std::pair<uint32_t, bool>> tapsAt(std::vector<uint32_t> downs, uint32_t holdUs = 60000) {
+  std::vector<std::pair<uint32_t, bool>> v;
+  for (uint32_t d : downs) { v.push_back({d, true}); v.push_back({d + holdUs, false}); }
+  return v;
+}
+static std::vector<Rec> stims(const std::vector<Rec> &r) {
+  std::vector<Rec> o;
+  for (auto &x : r) if (x.a.act == Act::Stim) o.push_back(x);
+  return o;
+}
+
+static void test_remote_single_tap_low() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  auto st = stims(remoteRun(m, tapsAt({2000000})));
+  TEST_ASSERT_EQUAL_INT(1, (int)st.size());
+  TEST_ASSERT_EQUAL_INT((int)Mode::Shock, (int)st[0].a.mode);
+  TEST_ASSERT_EQUAL_UINT8(c.lowPower, st[0].a.power);
+  TEST_ASSERT_TRUE_MESSAGE(st[0].t >= 2060000 + c.doubleClickUs, "el BAJO sale al vencer la ventana, no antes");
+}
+static void test_remote_double_tap_high() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  auto st = stims(remoteRun(m, tapsAt({2000000, 2150000})));
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, (int)st.size(), "un solo pulso (ALTO), sin BAJO previo");
+  TEST_ASSERT_EQUAL_UINT8(c.highPower, st[0].a.power);
+}
+static void test_remote_triple_tap_starts_ramp_without_low_or_high() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  auto st = stims(remoteRun(m, tapsAt({2000000, 2150000, 2300000})));
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, (int)st.size(), "el 3.º tap arranca la rampa; BAJO/ALTO cancelados");
+  TEST_ASSERT_EQUAL_UINT8(c.minRamp + c.step, st[0].a.power);
+  TEST_ASSERT_TRUE_MESSAGE(st[0].t < 2400000, "el pulso de rampa sale en el 3.er tap, sin esperar la ventana");
+}
+static void test_remote_ramp_one_step_per_tap_and_caps() {
+  Machine m; Config c = defaults(); c.cap = 8; m.reset(c, 0);
+  std::vector<uint32_t> d{2000000, 2150000, 2300000};
+  for (int i = 1; i <= 8; i++) d.push_back(2300000 + (uint32_t)i * 1000000);  // un tap por pulso (≥ minStimGap)
+  auto r = remoteRun(m, tapsAt(d));
+  auto st = stims(r);
+  TEST_ASSERT_TRUE(st.size() >= 5);
+  for (size_t k = 0; k < st.size(); k++) {
+    uint8_t exp = (uint8_t)(c.minRamp + (k + 1) * c.step);
+    if (exp > c.cap) exp = c.cap;
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(exp, st[k].a.power, "sube PASO por tap y respeta el TOPE (el nivel NO se reinicia a 1 tap/s)");
+  }
+  TEST_ASSERT_EQUAL_INT(-1, check(r, m.config()).index);
+}
+static void test_remote_ramp_resets_after_pause() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  auto st = stims(remoteRun(m, tapsAt({2000000, 2150000, 2300000, 2300000 + 1000000, 9000000, 9150000, 9300000})));
+  TEST_ASSERT_EQUAL_INT(3, (int)st.size());
+  TEST_ASSERT_EQUAL_UINT8(c.minRamp + c.step, st[0].a.power);
+  TEST_ASSERT_EQUAL_UINT8(c.minRamp + 2 * c.step, st[1].a.power);
+  TEST_ASSERT_EQUAL_UINT8_MESSAGE(c.minRamp + c.step, st[2].a.power, "tras una pausa larga la rampa vuelve al piso");
+}
+static void test_remote_disarmed_is_silent() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  auto r = remoteRun(m, tapsAt({2000000, 2150000, 2300000, 3000000}), false);
+  TEST_ASSERT_EQUAL_INT(0, (int)stims(r).size());
+  TEST_ASSERT_FALSE(m.armed());
+}
+static void test_remote_never_arms() {
+  Machine m; m.reset(defaults(), 0);
+  std::vector<uint32_t> d;
+  for (int i = 0; i < 30; i++) d.push_back(100000u + (uint32_t)i * 120000u);
+  remoteRun(m, tapsAt(d, 50000), false);
+  TEST_ASSERT_FALSE(m.armed());
+}
+static void test_remote_lost_drops_pending() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  uint32_t t0 = armDirect(m);
+  Action o[8];
+  for (uint32_t t = t0; t < 2000000; t += 20000) m.tick(t, o, 8);
+  m.feed(In::RemoteDown, 0, 2000000, o, 8);
+  m.feed(In::RemoteUp, 0, 2050000, o, 8);
+  m.remoteLost();  // el BLE cae con 1 tap pendiente
+  int n = 0;
+  for (uint32_t t = 2060000; t < 6000000; t += 20000) n += m.tick(t, o, 8);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, n, "un tap pendiente no se ejecuta tras perder el enlace");
+  // control: sin remoteLost() ese mismo tap SÍ sale (el test tiene dientes)
+  Machine m2; m2.reset(c, 0);
+  uint32_t u0 = armDirect(m2);
+  for (uint32_t t = u0; t < 2000000; t += 20000) m2.tick(t, o, 8);
+  m2.feed(In::RemoteDown, 0, 2000000, o, 8);
+  m2.feed(In::RemoteUp, 0, 2050000, o, 8);
+  int n2 = 0;
+  for (uint32_t t = 2060000; t < 6000000; t += 20000) n2 += m2.tick(t, o, 8);
+  TEST_ASSERT_EQUAL_INT(2, n2);  // Stim + Release
+}
+static void test_remote_stuck_button_does_not_block() {
+  Machine m; Config c = defaults(); m.reset(c, 0);
+  uint32_t t0 = armDirect(m);
+  Action o[8];
+  for (uint32_t t = t0; t < 2000000; t += 20000) m.tick(t, o, 8);
+  m.feed(In::RemoteDown, 0, 2000000, o, 8);  // el RemoteUp nunca llega
+  int n = 0;
+  for (uint32_t t = 2020000; t < 12000000; t += 20000) n += m.tick(t, o, 8);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, n, "un botón atascado no emite solo");
+  std::vector<Step> s{{12500000, In::RemoteDown, 0}, {12550000, In::RemoteUp, 0}};
+  std::vector<Rec> r;
+  run(m, s, r, 12400000);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, (int)stims(r).size(), "después sigue respondiendo");
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_arm_via_wiggle);
@@ -653,5 +767,14 @@ int main() {
   RUN_TEST(test_safety_zone_resets_after_pause);
   RUN_TEST(test_safety_zone_wiggle_within_zone);
   RUN_TEST(test_ramp_level_per_pulse_not_per_click);
+  RUN_TEST(test_remote_single_tap_low);
+  RUN_TEST(test_remote_double_tap_high);
+  RUN_TEST(test_remote_triple_tap_starts_ramp_without_low_or_high);
+  RUN_TEST(test_remote_ramp_one_step_per_tap_and_caps);
+  RUN_TEST(test_remote_ramp_resets_after_pause);
+  RUN_TEST(test_remote_disarmed_is_silent);
+  RUN_TEST(test_remote_never_arms);
+  RUN_TEST(test_remote_lost_drops_pending);
+  RUN_TEST(test_remote_stuck_button_does_not_block);
   return UNITY_END();
 }
