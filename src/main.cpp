@@ -1019,7 +1019,23 @@ static void pollRemote(uint32_t now) {
   remote::publish(g_m.armed(), shockEnabled(), g_m.rampLevel(), (uint8_t)g_lastN);
 }
 
+static constexpr uint32_t PAIR_WINDOW_MS = 60000;  // la ventana de emparejamiento dura 60 s
 static void pollPairing();  // definido con la pantalla (LCD/menú), más abajo
+
+// Gesto local para emparejar el control remoto SIN serial: DESARMADO y fuera del menú, mantener KEY 2 s (sin el botón del
+// encoder, que con KEY abre el menú) abre la ventana de emparejamiento del remoto (60 s, beep + pantalla).
+static void pollPairGesture(uint32_t now) {
+  static bool held, fired;
+  static uint32_t t0;
+  bool on = g_btnKey.pressed && !g_btnEnc.pressed && !g_m.armed() && !g_inMenu;
+  if (!on) { held = fired = false; return; }
+  if (!held) { held = true; t0 = now; }
+  if (!fired && (uint32_t)(now - t0) >= 2000000u) {
+    fired = true;
+    remote::openPairing(remote::Remote, PAIR_WINDOW_MS, BLE_REMOTE_PIN);
+    logAdd('P', 3, 0, 0);
+  }
+}
 
 static void pollGestures() {
   static bool prevActive = false;
@@ -1028,7 +1044,8 @@ static void pollGestures() {
   pollEncoder(now);
   pollBtn(g_btnEnc, In::BtnDown, In::BtnUp, now);
   pollBtn(g_btnKey, In::KeyDown, In::KeyUp, now);
-  pollPairing();    // PIN dinámico del emparejamiento en pantalla
+  pollPairGesture(now);  // KEY 2 s desarmado → ventana de emparejamiento del remoto
+  pollPairing();    // PIN dinámico / aviso de ventana en pantalla
   pollRemote(now);  // botón remoto (BLE): flancos encolados por NimBLE → misma máquina de gestos
   pollCombo(now);  // KEY + botón mantenidos (desarmado) → enciende la pantalla y abre el menú
   dispatch(g_actBuf, g_m.tick(now, g_actBuf, 16));
@@ -1519,10 +1536,28 @@ static void pollPairing() {
     g_lastInputMs = millis();  // no dormir mientras se empareja
     beep(1200, 60);
     logAdd('P', 1, 0, 0);
+  } else if (ev == 3 && g_lcdOk) {  // ventana del remoto: sin PIN en pantalla (el control trae el passkey compartido)
+    if (g_inMenu) menuClose(false);
+    lcdLockWait();
+    g_lcd.wakeup();
+    g_lcd.fillScreen(TFT_BLACK);
+    g_lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    g_lcd.setTextDatum(textdatum_t::middle_center);
+    g_lcd.setFont(&lgfx::fonts::Font4);
+    g_lcd.drawString("Emparejar control", g_lcd.width() / 2, g_lcd.height() / 2 - 14);
+    g_lcd.setFont(&lgfx::fonts::Font2);
+    g_lcd.drawString("enciende el control (60 s)", g_lcd.width() / 2, g_lcd.height() / 2 + 20);
+    digitalWrite(PIN_LCD_BL, HIGH);
+    lcdUnlock();
+    g_pairShown = true;
+    g_pairMs = millis();
+    g_lastInputMs = millis();
+    beep(1500, 60);
+    logAdd('P', 3, 0, 0);
   } else if (ev == 2) {
     pairScreenOff();
   }
-  if (g_pairShown && millis() - g_pairMs > 60000) pairScreenOff();
+  if (g_pairShown && millis() - g_pairMs > PAIR_WINDOW_MS) pairScreenOff();
 }
 
 static void pollUi() {
@@ -1567,13 +1602,22 @@ static void cmdBle(int argc, char **argv) {
     remote::dumpRing(Serial);
     return;
   }
+  if (argc > 1 && !strcmp(argv[1], "pair")) {  // abrir/cerrar la ventana de emparejamiento
+    if (argc > 2 && !strcmp(argv[2], "pc")) remote::openPairing(remote::Pc, PAIR_WINDOW_MS, BLE_REMOTE_PIN);
+    else if (argc > 2 && !strcmp(argv[2], "remoto")) remote::openPairing(remote::Remote, PAIR_WINDOW_MS, BLE_REMOTE_PIN);
+    else if (argc > 2 && !strcmp(argv[2], "off")) remote::closePairing();
+    else { Serial.println("uso: ble pair pc|remoto|off"); return; }
+    Serial.printf("BLE ventana de emparejamiento: %s\n", remote::pairKind() == remote::Pc ? "pc (PIN en pantalla)" : remote::pairKind() == remote::Remote ? "remoto (passkey compartido)" : "cerrada");
+    return;
+  }
   if (argc > 1 && !strcmp(argv[1], "clear")) {
     remote::clearBonds();
     Serial.println("BLE emparejamientos borrados");
     return;
   }
-  Serial.printf("BLE %s %s, emparejados=%d (ble clear = olvidar todos); heap interno libre=%u mayor bloque=%u\n",
-                remote::started() ? "iniciado" : (remote::initOk() ? "NO INICIADO (init ok)" : "NO INICIADO (init falló)"), remote::connected() ? "conectado" : "sin enlace", remote::bondCount(),
+  Serial.printf("BLE %s %s, ventana=%s, emparejados=%d (ble clear = olvidar todos); heap interno libre=%u mayor bloque=%u\n",
+                remote::started() ? "iniciado" : (remote::initOk() ? "NO INICIADO (init ok)" : "NO INICIADO (init falló)"), remote::connected() ? "conectado" : "sin enlace",
+                remote::pairKind() == remote::Pc ? "pc" : remote::pairKind() == remote::Remote ? "remoto" : "cerrada", remote::bondCount(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   Serial.printf("  enlace: anunciando=%d conexiones=%u desconexiones=%u última razón=0x%X (duró %u ms) enc=%d reinicios de anuncio=%u fallos de cifrado=%u escrituras rechazadas=%u\n",
                 remote::advertising(), (unsigned)remote::nConn(), (unsigned)remote::nDisc(), (unsigned)remote::lastReason(),

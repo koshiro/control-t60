@@ -99,3 +99,17 @@ El T-Embed expone un servidor BLE cifrado (NimBLE, PIN aleatorio por emparejamie
 (apretado/suelto) y la máquina de gestos decide: **1 toque = shock/vibrar bajo, 2 = alto, 3+ = rampa** (un toque por
 pulso). No arma ni desarma (eso sigue siendo el wiggle de la rueda); si el enlace cae se descartan los toques
 pendientes. Pruebas desde el Mac: `tools/remote-mac/README.md`. Serial: `ble` (estado), `ble clear` (olvidar emparejados).
+
+### Emparejamiento (ventana local) y control remoto sin teclado
+
+Fuera de una **ventana de emparejamiento** nadie puede emparejar: el passkey es aleatorio y no se muestra; los ya
+emparejados reconectan con su clave sin PIN. La ventana dura 60 s, se cierra sola al emparejar y se abre así:
+
+- **Control remoto sin teclado:** DESARMADO, mantener **KEY 2 s** (o `ble pair remoto` por serial). La pantalla dice
+  "Emparejar control". Usa el **passkey compartido** `BLE_REMOTE_PIN` de `.env` (patrón oficial
+  `Server_secure_static_passkey` / `Client_secure_static_passkey` del core Arduino-ESP32).
+- **Mac/celular con teclado:** `ble pair pc` por serial; el PIN aleatorio (nuevo por intento) aparece en la pantalla.
+
+Firmware del control (ESP32, cliente BLE): copiar `Client_secure_static_passkey` del core: `setPassKey(true, <BLE_REMOTE_PIN>)`,
+`setCapability(ESP_IO_CAP_IN)` y `setAuthenticationMode(true, true, true)`; el servicio es `6e7a0001-b5a3-f393-e0a9-e50e24dcca9e`.
+Tras el primer emparejamiento queda la clave (bond) y el passkey ya no interviene; para rotarlo, cambiar `.env` en ambos firmwares.

@@ -74,33 +74,69 @@ function onStatus(ev) {
   if (pulses !== null && n !== pulses) log(`el T-Embed emitió un pulso (total ${n})`);
   pulses = n;
 }
-function onDisconnect() {
+function resetUi() {
   cmd = null; pressed = false; pulses = null;
   $("btn").disabled = true; $("btn").classList.remove("down");
-  $("conn").textContent = "Conectar";
   setState($("sLink"), "sin enlace", "off");
   for (const id of ["sArm", "sShock", "sRamp"]) setState($(id), "—", "off");
+}
+
+// Patrón del ejemplo oficial de Chrome (Web Bluetooth / Automatic Reconnect): conservar el `device`, reintentar
+// gatt.connect() con backoff exponencial y un máximo de intentos, y re-pedir servicios y características tras CADA conexión.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let userStop = false, retrying = false;
+
+async function setup() {
+  const srv = await dev.gatt.connect();
+  const svc = await srv.getPrimaryService(SERVICE);
+  cmd = await svc.getCharacteristic(CMD);
+  const st = await svc.getCharacteristic(STATUS);
+  st.addEventListener("characteristicvaluechanged", onStatus);
+  await st.startNotifications();
+  onStatus({ target: { value: await st.readValue() } });
+  $("btn").disabled = false;
+  $("conn").textContent = "Desconectar";
+  setState($("sLink"), "ok", "on");
+}
+
+async function connectWithRetry(maxTries = 5, delay = 500) {
+  if (retrying) return;
+  retrying = true;
+  try {
+    for (let i = 1; i <= maxTries && !userStop; i++) {
+      try {
+        log(`conectando (intento ${i}/${maxTries}); la primera vez el Mac pide el PIN que muestra el T-Embed`);
+        await setup();
+        log("listo");
+        return;
+      } catch (e) {
+        log("falló: " + e.message);
+        if (dev.gatt.connected) dev.gatt.disconnect();
+        if (i < maxTries) { log(`reintento en ${delay} ms`); await sleep(delay); delay *= 2; }
+      }
+    }
+    if (!userStop) log("no se pudo conectar; revisa que el T-Embed esté despierto y use Conectar de nuevo");
+    $("conn").textContent = "Conectar";
+  } finally { retrying = false; }
+}
+
+function onDisconnect() {
+  resetUi();
   log("desconectado");
+  if (userStop) { $("conn").textContent = "Conectar"; return; }
+  connectWithRetry();  // caída inesperada: reconectar solo (no pide otro requestDevice)
 }
 
 async function connect() {
-  if (dev && dev.gatt.connected) { dev.gatt.disconnect(); return; }
+  if (dev && dev.gatt.connected) { userStop = true; dev.gatt.disconnect(); return; }
+  userStop = false;
   try {
-    dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
-    dev.addEventListener("gattserverdisconnected", onDisconnect);
-    log("conectando a " + (dev.name || "dispositivo") + " (la primera vez el Mac pide el PIN que muestra el T-Embed)");
-    const srv = await dev.gatt.connect();
-    const svc = await srv.getPrimaryService(SERVICE);
-    cmd = await svc.getCharacteristic(CMD);
-    const st = await svc.getCharacteristic(STATUS);
-    st.addEventListener("characteristicvaluechanged", onStatus);
-    await st.startNotifications();
-    onStatus({ target: { value: await st.readValue() } });
-    $("btn").disabled = false;
-    $("conn").textContent = "Desconectar";
-    setState($("sLink"), "ok", "on");
-    log("listo");
-  } catch (e) { log("no se pudo conectar: " + e.message); if (dev && dev.gatt.connected) dev.gatt.disconnect(); }
+    if (!dev) {
+      dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+      dev.addEventListener("gattserverdisconnected", onDisconnect);
+    }
+    await connectWithRetry();
+  } catch (e) { log("no se pudo elegir el dispositivo: " + e.message); }
 }
 
 $("conn").addEventListener("click", connect);

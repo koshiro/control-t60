@@ -6,8 +6,10 @@ App local (Web Bluetooth) para probar el botón remoto del T-Embed. Requiere **C
 python3 -m http.server 8765 --directory tools/remote-mac   # y abrir http://localhost:8765
 ```
 
+0. **Primer emparejamiento (solo una vez, o tras `ble clear`):** abrir la ventana de 60 s con `ble pair pc` por serial; el PIN
+   de 6 dígitos aparece en la pantalla del T-Embed. Fuera de una ventana nadie puede emparejar; los ya emparejados reconectan solos.
 1. En el T-Embed: armar con el wiggle de la rueda (el remoto no arma).
-2. **Conectar** → elegir "T60 control". La primera vez macOS pide un PIN de 6 dígitos: **aparece en la pantalla del T-Embed** (es nuevo en cada emparejamiento).
+2. **Conectar** → elegir "T60 control" (reintenta solo con backoff y reconecta si el enlace cae). En el primer emparejamiento macOS pide el PIN que muestra el T-Embed.
 3. Mantener el botón (o la barra espaciadora): 1 toque = bajo, 2 = alto, 3+ = rampa.
 
 Protocolo GATT (servicio `6e7a0001-b5a3-f393-e0a9-e50e24dcca9e`, todo cifrado):

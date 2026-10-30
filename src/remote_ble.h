@@ -28,7 +28,11 @@ static BLEServer *g_srv;
 static BLECharacteristic *g_status;
 static volatile bool g_conn;
 static volatile uint32_t g_pin;     // PIN del emparejamiento en curso
-static volatile uint8_t g_pairEv;   // 0 nada · 1 mostrar PIN · 2 emparejamiento terminado (ocultar)
+static volatile uint8_t g_pairEv;   // 0 nada · 1 mostrar PIN · 2 ocultar · 3 ventana de emparejamiento del remoto abierta
+enum PairKind : uint8_t { Closed = 0, Pc = 1, Remote = 2 };
+static volatile uint8_t g_pairKind;  // ventana de emparejamiento: Closed = nadie puede emparejar
+static uint32_t g_pairUntil;         // millis() en que vence la ventana
+static uint32_t g_discAt;            // millis() de la última desconexión (reanudar el anuncio con espera, como Server_multiconnect)
 static bool g_initOk;               // diagnóstico (`ble`)
 static uint32_t g_heapBefore, g_heapAfter;
 // Diagnóstico del enlace (se muestra con `ble`): contadores y razón de la última desconexión (códigos NimBLE: 0x200 + HCI;
@@ -36,6 +40,16 @@ static uint32_t g_heapBefore, g_heapAfter;
 static volatile uint32_t g_nConn, g_nDisc, g_lastReason, g_lastLinkMs, g_advRestarts, g_connAt;
 static volatile int g_lastEnc = -1;
 static volatile uint32_t g_authFail, g_wRejected;  // fallos de cifrado vistos · escrituras rechazadas por enlace no seguro
+
+// Ventana de emparejamiento. Cerrada: passkey ALEATORIO que nadie ve → un desconocido no puede emparejar (los ya
+// emparejados reconectan con su clave, sin PIN). Pc: PIN aleatorio nuevo por intento, mostrado en la pantalla (Mac/celular
+// con teclado). Remote: passkey compartido `pin` (patrón oficial Server/Client_secure_static_passkey: el cliente sin
+// teclado lo trae en su firmware con ESP_IO_CAP_IN).
+static void closePairingNow() {
+  g_pairKind = Closed;
+  BLESecurity::setPassKey(false);
+  BLESecurity::regenPassKeyOnConnect(true);
+}
 
 static void push(uint8_t ev) {
   if (g_q) xQueueSend(g_q, &ev, 0);
@@ -50,13 +64,14 @@ class SrvCb : public BLEServerCallbacks {
     g_conn = false;
     g_pairEv = 2;  // si había un PIN en pantalla, ocultarlo
     push(Lost);
-    BLEDevice::startAdvertising();
+    g_discAt = millis() ? millis() : 1;  // el anuncio se reanuda desde keepAdvertising() tras 500 ms (ejemplo Server_multiconnect)
   }
 };
 
 class SecCb : public BLESecurityCallbacks {
-  void onPassKeyNotify(uint32_t k) override {  // PIN aleatorio nuevo por emparejamiento: mostrarlo en la pantalla
-    g_pin = k;
+  void onPassKeyNotify(uint32_t k) override {
+    if (g_pairKind != Pc) return;  // fuera de una ventana (o con la del remoto, de passkey compartido) no se muestra nada
+    g_pin = k;                     // ventana Pc: PIN aleatorio nuevo, a la pantalla del T-Embed
     g_pairEv = 1;
   }
   bool onSecurityRequest() override { return true; }
@@ -64,8 +79,8 @@ class SecCb : public BLESecurityCallbacks {
   // enlace aquí: medido 2026-10-30, cortar en ese timeout tiraba un enlace que ya funcionaba (razón 0x216 a los 30 s).
   // La seguridad la imponen los permisos ENC+AUTHEN de las características y el chequeo de onWrite.
   void onAuthenticationComplete(ble_gap_conn_desc *, int status) override {
-    g_pairEv = 2;
-    if (status != 0) g_authFail++;
+    if (status != 0) { g_authFail++; return; }
+    if (g_pairKind != Closed) { closePairingNow(); g_pairEv = 2; }  // emparejó bien: la ventana se cierra sola
   }
 };
 
@@ -111,6 +126,21 @@ static int gapDiag(struct ble_gap_event *e, void *) {
   return 0;
 }
 
+inline void openPairing(uint8_t kind, uint32_t ms, uint32_t sharedPin) {
+  if (kind == Remote) {
+    BLESecurity::setPassKey(true, sharedPin);
+    BLESecurity::regenPassKeyOnConnect(false);
+    g_pairEv = 3;
+  } else {
+    BLESecurity::setPassKey(false);
+    BLESecurity::regenPassKeyOnConnect(true);
+  }
+  g_pairKind = kind;
+  g_pairUntil = millis() + ms;
+}
+inline void closePairing() { closePairingNow(); g_pairEv = 2; }
+inline uint8_t pairKind() { return g_pairKind; }
+
 static SrvCb g_srvCb;
 static SecCb g_secCb;
 static CmdCb g_cmdCb;
@@ -124,8 +154,7 @@ inline void begin(const char *name) {
   g_initOk = true;
   BLESecurity::setAuthenticationMode(true, true, true);  // bonding + MITM + Secure Connections
   BLESecurity::setCapability(ESP_IO_CAP_OUT);           // solo pantalla: el PIN se muestra aquí y se teclea en el Mac
-  BLESecurity::setPassKey(false);                       // aleatorio...
-  BLESecurity::regenPassKeyOnConnect(true);             // ...y nuevo en cada conexión
+  closePairingNow();                                    // de arranque nadie puede emparejar: se abre una ventana a propósito
   BLEDevice::setSecurityCallbacks(&g_secCb);
   BLEDevice::setCustomGapHandler(gapDiag);
   g_srv = BLEDevice::createServer();
@@ -144,6 +173,8 @@ inline void begin(const char *name) {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(kService);
   adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);  // como Server_secure_static_passkey: "functions that help with iPhone connections issue"
+  adv->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
   g_heapAfter = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
 }
@@ -159,12 +190,16 @@ inline void end() {
 
 // Watchdog del anuncio: si no hay enlace y no se está anunciando, reanudar (cuenta cuántas veces hizo falta).
 inline void keepAdvertising() {
-  if (!g_srv || g_conn) return;
+  if (!g_srv) return;
+  if (g_pairKind != Closed && (int32_t)(millis() - g_pairUntil) >= 0) closePairing();  // venció la ventana
+  if (g_conn) return;
+  if (g_discAt && millis() - g_discAt < 500) return;  // dar tiempo al stack tras la desconexión (Server_multiconnect)
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   if (adv && !adv->isAdvertising()) {
     BLEDevice::startAdvertising();
     g_advRestarts++;
   }
+  g_discAt = 0;
 }
 inline bool advertising() { BLEAdvertising *a = g_srv ? BLEDevice::getAdvertising() : nullptr; return a && a->isAdvertising(); }
 inline uint32_t nConn() { return g_nConn; }
