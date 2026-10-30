@@ -1563,6 +1563,10 @@ static void cmdMenu(int argc, char **argv) {
 // Encender: tres beeps agudos locales; apagar: uno grave y se vacía la cola de TX (no sale un shock ya encolado).
 // Se guarda en NVS en el momento (persiste entre arranques; `nvs clear` lo deja apagado).
 static void cmdBle(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "ev")) {  // traza de eventos GAP (diagnóstico del enlace)
+    remote::dumpRing(Serial);
+    return;
+  }
   if (argc > 1 && !strcmp(argv[1], "clear")) {
     remote::clearBonds();
     Serial.println("BLE emparejamientos borrados");

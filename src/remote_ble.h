@@ -78,7 +78,22 @@ class CmdCb : public BLECharacteristicCallbacks {
   }
 };
 
+struct GapEv { uint32_t ms; uint8_t type; int16_t code; };
+static GapEv g_ring[32];
+static volatile uint32_t g_ringN;
+static void ringAdd(uint8_t type, int code) {
+  g_ring[g_ringN & 31] = {millis(), type, (int16_t)code};
+  g_ringN++;
+}
+
 static int gapDiag(struct ble_gap_event *e, void *) {
+  switch (e->type) {
+    case BLE_GAP_EVENT_CONNECT: ringAdd(e->type, e->connect.status); break;
+    case BLE_GAP_EVENT_DISCONNECT: ringAdd(e->type, e->disconnect.reason); break;
+    case BLE_GAP_EVENT_ENC_CHANGE: ringAdd(e->type, e->enc_change.status); break;
+    case BLE_GAP_EVENT_PARING_COMPLETE: ringAdd(e->type, e->pairing_complete.status); break;
+    default: ringAdd(e->type, 0); break;
+  }
   switch (e->type) {
     case BLE_GAP_EVENT_CONNECT:
       if (e->connect.status == 0) { g_nConn++; g_connAt = millis(); }
@@ -157,6 +172,29 @@ inline uint32_t nDisc() { return g_nDisc; }
 inline uint32_t lastReason() { return g_lastReason; }
 inline uint32_t lastLinkMs() { return g_lastLinkMs; }
 inline uint32_t advRestarts() { return g_advRestarts; }
+inline const char *evName(uint8_t t) {
+  switch (t) {
+    case BLE_GAP_EVENT_CONNECT: return "CONNECT";
+    case BLE_GAP_EVENT_DISCONNECT: return "DISCONNECT";
+    case BLE_GAP_EVENT_CONN_UPDATE: return "CONN_UPDATE";
+    case BLE_GAP_EVENT_ENC_CHANGE: return "ENC_CHANGE";
+    case BLE_GAP_EVENT_PASSKEY_ACTION: return "PASSKEY_ACTION";
+    case BLE_GAP_EVENT_REPEAT_PAIRING: return "REPEAT_PAIRING";
+    case BLE_GAP_EVENT_PARING_COMPLETE: return "PAIRING_COMPLETE";
+    case BLE_GAP_EVENT_SUBSCRIBE: return "SUBSCRIBE";
+    case BLE_GAP_EVENT_MTU: return "MTU";
+    case BLE_GAP_EVENT_ADV_COMPLETE: return "ADV_COMPLETE";
+    default: return "?";
+  }
+}
+inline void dumpRing(Print &out) {
+  uint32_t n = g_ringN, first = n > 32 ? n - 32 : 0;
+  out.printf("  eventos GAP (últimos %u, ms desde el arranque):\n", (unsigned)(n - first));
+  for (uint32_t i = first; i < n; i++) {
+    const GapEv &g = g_ring[i & 31];
+    out.printf("    %10u  %-17s tipo=%u código=%d (0x%X)\n", (unsigned)g.ms, evName(g.type), g.type, g.code, (unsigned)(uint16_t)g.code);
+  }
+}
 inline uint32_t authFail() { return g_authFail; }
 inline uint32_t wRejected() { return g_wRejected; }
 inline int lastEnc() { return g_lastEnc; }
