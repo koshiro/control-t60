@@ -25,15 +25,18 @@ static constexpr uint32_t CONNECT_BUDGET_MS = 12000;  // si no hay enlace en est
 
 static const BLEUUID kService("6e7a0001-b5a3-f393-e0a9-e50e24dcca9e");
 static const BLEUUID kCmdChar("6e7a0002-b5a3-f393-e0a9-e50e24dcca9e");
+static const BLEUUID kStatusChar("6e7a0003-b5a3-f393-e0a9-e50e24dcca9e");  // lectura cifrada: sirve para disparar la seguridad
 
 static BLEClient *g_client;
 static BLERemoteCharacteristic *g_cmd;
 static volatile bool g_connected;
 static Preferences g_prefs;
 
+// Eventos del botón con su hora (ms desde el arranque). Los registra una TAREA aparte para no perder ningún flanco mientras
+// setup() está bloqueado conectando (1-3 s): antes se perdía el UP si se soltaba antes de conectar.
 struct Ev { uint32_t ts; uint8_t down; };
-static Ev g_q[32];
-static uint8_t g_qn;  // eventos pendientes de enviar (los de antes de conectar se reproducen con su tiempo relativo)
+static QueueHandle_t g_evq;
+static uint32_t g_t0;
 
 class ClientCb : public BLEClientCallbacks {
   void onConnect(BLEClient *) override { Serial.println("enlace: conectado"); }
@@ -62,7 +65,22 @@ class ScanCb : public BLEAdvertisedDeviceCallbacks {
 static bool btnDown() { return digitalRead(PIN_BTN) == LOW; }
 
 static void pushEv(uint32_t ts, uint8_t down) {
-  if (g_qn < sizeof g_q / sizeof g_q[0]) g_q[g_qn++] = {ts, down};
+  Ev e{ts, down};
+  xQueueSend(g_evq, &e, 0);
+}
+
+static void btnTask(void *) {
+  bool last = btnDown();  // el pulso que nos despertó ya se encoló en setup() (ts=0); aquí solo los flancos nuevos
+  uint32_t tEdge = 0;
+  for (;;) {
+    bool now = btnDown();
+    if (now != last && millis() - tEdge >= DEBOUNCE_MS) {
+      tEdge = millis();
+      last = now;
+      pushEv(millis() - g_t0, now ? 1 : 0);
+    }
+    vTaskDelay(1);
+  }
 }
 
 // Conecta al T-Embed: primero por la dirección guardada (rápido), si no escaneando por el servicio. Devuelve true con la
@@ -101,13 +119,19 @@ static bool connectToTembed() {
   BLERemoteService *svc = g_client->getService(kService);
   g_cmd = svc ? svc->getCharacteristic(kCmdChar) : nullptr;
   if (!g_cmd) { Serial.println("servicio o característica no encontrados"); g_client->disconnect(); return false; }
-  // Pedir el cifrado ya (NimBLE lo haría al primer acceso protegido): con bond reutiliza la clave; sin bond, empareja con el
-  // passkey compartido (el T-Embed debe tener la ventana del remoto abierta).
-  if (!g_client->secureConnection()) {
+  // Como el ejemplo oficial Client_secure_static_passkey: en NimBLE la seguridad se negocia "a demanda" al leer una
+  // característica protegida. (BLEClient::secureConnection() espera el cifrado con BLE_NPL_TIME_FOREVER y se colgaba.) Con
+  // bond reutiliza la clave; sin bond empareja con el passkey compartido (el T-Embed debe tener la ventana del remoto
+  // abierta). Una escritura sin respuesta NO sirve para esto: si el permiso falta, el servidor la descarta en silencio.
+  BLERemoteCharacteristic *st = svc->getCharacteristic(kStatusChar);
+  if (!st || !st->canRead()) { Serial.println("característica de estado no encontrada"); g_client->disconnect(); return false; }
+  String v = st->readValue();
+  if (v.length() < 4 || !g_client->isConnected()) {
     Serial.println("el cifrado falló (¿ventana de emparejamiento cerrada o passkey distinto?)");
     g_client->disconnect();
     return false;
   }
+  Serial.printf("T-Embed: armado=%d shock=%d rampa=%d\n", v[0], v[1], v[2]);
   return true;
 }
 
@@ -122,22 +146,28 @@ static void sleepNow() {
   Serial.println("durmiendo (despierta con el botón)");
   Serial.flush();
   if (g_client && g_client->isConnected()) g_client->disconnect();
-  while (btnDown()) delay(5);  // esperar a soltar: con el botón apretado se despertaría al instante
+  uint32_t tw = millis();
+  while (btnDown() && millis() - tw < 3000) delay(5);  // esperar a soltar: con el botón apretado se despertaría al instante
   delay(30);
-  gpio_pullup_en(PIN_BTN);
-  gpio_pulldown_dis(PIN_BTN);
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_BTN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Botón atascado en LOW (¿mal cableado?): despertar por flanco a HIGH en vez de gastar la pila en un bucle de arranque.
+  bool stuck = btnDown();
+  if (stuck) Serial.println("AVISO: GPIO3 sigue en LOW tras 3 s (botón atascado o mal cableado)");
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << PIN_BTN, stuck ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
 }
 
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis();
+  g_t0 = t0;
+  g_evq = xQueueCreate(32, sizeof(Ev));
   pinMode(PIN_BTN, INPUT_PULLUP);
   bool wokeByBtn = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;
-  Serial.printf("\nT60 remoto %s, arranque por %s\n", FW_VERSION, wokeByBtn ? "botón" : "encendido/reset");
+  Serial.printf("\nT60 remoto %s, arranque por %s, GPIO3=%s\n", FW_VERSION, wokeByBtn ? "botón" : "encendido/reset",
+                btnDown() ? "LOW (apretado)" : "HIGH (suelto)");
   // El pulso que nos despertó ya está en curso: es el 1.er DOWN, con ts=0.
   if (btnDown()) pushEv(0, 1);
+  xTaskCreate(btnTask, "btn", 2048, nullptr, 2, nullptr);
 
   g_prefs.begin("remote", false);
   BLEDevice::init("T60 remoto");  // sin nvs_flash_erase(): el bond debe sobrevivir al deep sleep
@@ -154,30 +184,36 @@ void setup() {
   }
   if (!linked) { Serial.println("sin enlace: a dormir"); sleepNow(); }
 
-  // Reproducir los eventos que ocurrieron antes de estar conectado, con su tiempo relativo.
-  uint32_t base = millis();
-  for (uint8_t i = 0; i < g_qn; i++) {
-    while (millis() - base < g_q[i].ts - g_q[0].ts) delay(1);
-    sendEv(g_q[i].down);
+  // Reproducir los eventos de antes de estar conectado con su tiempo relativo (la máquina del T-Embed cuenta los toques con
+  // SU reloj y una ventana de 300 ms); los posteriores salen en loop() al instante.
+  uint32_t tConn = millis() - t0, base = millis(), first = 0;
+  bool haveFirst = false;
+  Ev e;
+  while (xQueuePeek(g_evq, &e, 0) == pdTRUE && e.ts <= tConn) {
+    xQueueReceive(g_evq, &e, 0);
+    if (!haveFirst) { first = e.ts; haveFirst = true; }
+    while (millis() - base < e.ts - first) delay(1);
+    sendEv(e.down);
   }
-  g_qn = 0;
 }
 
 void loop() {
-  static bool last = btnDown();
-  static uint32_t tEdge = 0, tLast = millis();
-  bool now = btnDown();
-  if (now != last && millis() - tEdge >= DEBOUNCE_MS) {
-    tEdge = millis();
-    last = now;
+  static uint32_t tLast = millis(), tLevel = millis();
+  Ev e;
+  while (xQueueReceive(g_evq, &e, 0) == pdTRUE) {
     tLast = millis();
-    sendEv(now ? 1 : 0);
+    sendEv(e.down);
   }
   if (!g_connected) {  // el enlace cayó con el botón en uso: un intento de reconexión corto, si no a dormir
     Serial.println("enlace perdido: reconectando");
     if (!connectToTembed()) sleepNow();
     tLast = millis();
   }
+  if (millis() - tLevel > 2000) {  // diagnóstico: nivel del pin (un botón mal cableado puede leerse siempre LOW)
+    tLevel = millis();
+    Serial.printf("GPIO3=%s\n", btnDown() ? "LOW" : "HIGH");
+  }
+  if (btnDown()) tLast = millis();  // con el botón apretado no se duerme: así el UP siempre sale al soltar
   if (millis() - tLast > AWAKE_MS) sleepNow();
   delay(2);
 }
