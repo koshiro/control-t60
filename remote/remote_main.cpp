@@ -19,6 +19,7 @@
 #endif
 
 static constexpr gpio_num_t PIN_BTN = GPIO_NUM_3;  // botón entre GPIO3 y GND (pull-up interno)
+static constexpr gpio_num_t PIN_LED = GPIO_NUM_8;  // LED azul de la placa, activo en LOW (depuración visual en tiempo real)
 static constexpr uint32_t DEBOUNCE_MS = 15;
 static constexpr uint32_t AWAKE_MS = 6000;         // despierto tras el último evento (ventana para 2º/3er toque y rampa)
 static constexpr uint32_t CONNECT_BUDGET_MS = 12000;  // si no hay enlace en este tiempo, volver a dormir (no gastar pila)
@@ -63,6 +64,13 @@ class ScanCb : public BLEAdvertisedDeviceCallbacks {
 };
 
 static bool btnDown() { return digitalRead(PIN_BTN) == LOW; }
+
+// LED de depuración (se ve sin terminal): fijo = conectando · 2 parpadeos = enlace listo · sigue al botón mientras se envía ·
+// 5 parpadeos rápidos = error · 1 largo = a dormir.
+static void led(bool on) { digitalWrite(PIN_LED, on ? LOW : HIGH); }
+static void blink(int n, int onMs, int offMs) {
+  for (int i = 0; i < n; i++) { led(true); delay(onMs); led(false); delay(offMs); }
+}
 
 static void pushEv(uint32_t ts, uint8_t down) {
   Ev e{ts, down};
@@ -139,12 +147,15 @@ static bool sendEv(uint8_t down) {
   if (!g_connected || !g_cmd) return false;
   bool ok = g_cmd->writeValue(&down, 1, false);
   Serial.printf("-> %s %s\n", down ? "DOWN" : "UP", ok ? "ok" : "ERROR");
+  if (ok) led(down);          // el LED sigue al botón solo si el evento SALIÓ
+  else blink(5, 60, 60);      // error de envío
   return ok;
 }
 
 static void sleepNow() {
   Serial.println("durmiendo (despierta con el botón)");
   Serial.flush();
+  led(true); delay(400); led(false);  // un parpadeo largo: a dormir
   if (g_client && g_client->isConnected()) {
     g_client->disconnect();
     // Esperar la confirmación del corte ANTES de apagar la radio: si se duerme de inmediato, el T-Embed lo ve como
@@ -170,6 +181,8 @@ void setup() {
   g_t0 = t0;
   g_evq = xQueueCreate(32, sizeof(Ev));
   pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_LED, OUTPUT);
+  led(false);
   bool wokeByBtn = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;
   Serial.printf("\nT60 remoto %s, arranque por %s, GPIO3=%s\n", FW_VERSION, wokeByBtn ? "botón" : "encendido/reset",
                 btnDown() ? "LOW (apretado)" : "HIGH (suelto)");
@@ -186,11 +199,14 @@ void setup() {
   BLEDevice::setSecurityCallbacks(new SecCb());
 
   bool linked = false;
+  led(true);  // fijo mientras conecta
   while (!linked && millis() - t0 < CONNECT_BUDGET_MS) {
     linked = connectToTembed();
     if (!linked) delay(300);
   }
-  if (!linked) { Serial.println("sin enlace: a dormir"); sleepNow(); }
+  if (!linked) { Serial.println("sin enlace: a dormir"); blink(5, 60, 60); sleepNow(); }
+  led(false);
+  blink(2, 50, 50);  // enlace listo
 
   // Reproducir los eventos de antes de estar conectado con su tiempo relativo (la máquina del T-Embed cuenta los toques con
   // SU reloj y una ventana de 300 ms); los posteriores salen en loop() al instante.
@@ -214,7 +230,10 @@ void loop() {
   }
   if (!g_connected) {  // el enlace cayó con el botón en uso: un intento de reconexión corto, si no a dormir
     Serial.println("enlace perdido: reconectando");
-    if (!connectToTembed()) sleepNow();
+    led(true);
+    if (!connectToTembed()) { blink(5, 60, 60); sleepNow(); }
+    led(false);
+    blink(2, 50, 50);
     tLast = millis();
   }
   if (millis() - tLevel > 2000) {  // diagnóstico: nivel del pin (un botón mal cableado puede leerse siempre LOW)
