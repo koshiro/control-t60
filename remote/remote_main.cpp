@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 
 #ifndef BLE_REMOTE_PIN
 #error "BLE_REMOTE_PIN lo define tools/build_env_remote.py desde .env"
@@ -64,6 +65,22 @@ class ScanCb : public BLEAdvertisedDeviceCallbacks {
 };
 
 static bool btnDown() { return digitalRead(PIN_BTN) == LOW; }
+
+static const char *resetName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "encendido";
+    case ESP_RST_EXT: return "pin RST";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "PÁNICO";
+    case ESP_RST_INT_WDT: return "watchdog de interrupciones";
+    case ESP_RST_TASK_WDT: return "watchdog de tarea";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "despertar de deep sleep";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (voltaje bajo)";
+    case ESP_RST_USB: return "USB";
+    default: return "otro";
+  }
+}
 
 // LED de depuración (se ve sin terminal): fijo = conectando · 2 parpadeos = enlace listo · sigue al botón mientras se envía ·
 // 5 parpadeos rápidos = error · 1 largo = a dormir.
@@ -191,6 +208,14 @@ void setup() {
   xTaskCreate(btnTask, "btn", 2048, nullptr, 2, nullptr);
 
   g_prefs.begin("remote", false);
+  // Diagnóstico de alimentación: por qué arrancó y cuántos brownouts acumula (se lee por USB tras una prueba con pila).
+  esp_reset_reason_t rr = esp_reset_reason();
+  uint32_t nBoot = g_prefs.getUInt("nboot", 0) + 1, nBrown = g_prefs.getUInt("nbrown", 0), nPanic = g_prefs.getUInt("npanic", 0);
+  g_prefs.putUInt("nboot", nBoot);
+  if (rr == ESP_RST_BROWNOUT) g_prefs.putUInt("nbrown", ++nBrown);
+  if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT) g_prefs.putUInt("npanic", ++nPanic);
+  Serial.printf("reinicio: %s | arranques=%u brownouts=%u pánicos/watchdog=%u\n", resetName(rr), nBoot, nBrown, nPanic);
+  if (rr == ESP_RST_BROWNOUT) blink(3, 400, 200);  // LED: 3 parpadeos LARGOS = el arranque anterior fue por voltaje bajo
   BLEDevice::init("T60 remoto");  // sin nvs_flash_erase(): el bond debe sobrevivir al deep sleep
   BLESecurity *sec = new BLESecurity();
   sec->setPassKey(true, BLE_REMOTE_PIN);
