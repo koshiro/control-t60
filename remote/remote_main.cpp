@@ -145,7 +145,15 @@ static bool sendEv(uint8_t down) {
 static void sleepNow() {
   Serial.println("durmiendo (despierta con el botón)");
   Serial.flush();
-  if (g_client && g_client->isConnected()) g_client->disconnect();
+  if (g_client && g_client->isConnected()) {
+    g_client->disconnect();
+    // Esperar la confirmación del corte ANTES de apagar la radio: si se duerme de inmediato, el T-Embed lo ve como
+    // supervision timeout (0x208, ~4 s con el enlace "abierto" y sin anunciar) y no encuentra al control si se pulsa de nuevo.
+    uint32_t td = millis();
+    while (g_connected && millis() - td < 800) delay(5);
+    Serial.printf("corte %s (%u ms)\n", g_connected ? "SIN confirmar" : "limpio", (unsigned)(millis() - td));
+    Serial.flush();
+  }
   uint32_t tw = millis();
   while (btnDown() && millis() - tw < 3000) delay(5);  // esperar a soltar: con el botón apretado se despertaría al instante
   delay(30);
