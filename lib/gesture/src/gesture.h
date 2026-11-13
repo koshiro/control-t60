@@ -15,6 +15,12 @@
 //   KEY toque corto     -> Stim(Vibrar, keyVibr)  + Release
 //   KEY mantenida       -> pulsos de Tono REPETIDOS a la cadencia mientras se mantiene (el collar no sostiene;
 //                          re-disparar es la única forma de que suene repetido). Cada pulso = Stim + Release.
+//   ANILLO (Ring01 por BLE, 3 botones; el firmware traduce sus reportes HID a In::Ring con data = botón 0..2):
+//     botón 0: 1 click = vibrar · 2 = vibrar fuerte · 3 = rampa de vibrar
+//     botón 1: 1 click = shock BAJO · 2 = shock ALTO · 3 = rampa de shock
+//     botón 2: 1 click = tono · 2 = doble tono · 3 = alterna la luz (Act::LightToggle, no es estímulo)
+//     La rampa del anillo es automática (un pulso por cadencia, +PASO, hasta maxRampUs) y la corta CUALQUIER
+//     entrada (click del anillo, rueda, botón, KEY) o la pérdida del enlace (In::RingLost).
 // Nada sale si no está ARMADO. Armar = mantener KEY >= armHoldUs estando DESARMADO. Desarme por inactividad.
 #pragma once
 #include <stddef.h>
@@ -22,9 +28,10 @@
 
 namespace gesture {
 
-enum class In : uint8_t { BtnDown, BtnUp, Wheel, KeyDown, KeyUp };  // Wheel lleva data = +1/-1 (sentido)
+// Wheel lleva data = +1/-1 (sentido); Ring lleva data = botón 0..2 (un click); RingLost = se cayó el enlace BLE.
+enum class In : uint8_t { BtnDown, BtnUp, Wheel, KeyDown, KeyUp, Ring, RingLost };
 enum class Mode : uint8_t { None, Shock, Vibrar, Tono, Luz };
-enum class Act : uint8_t { None, Stim, Release };
+enum class Act : uint8_t { None, Stim, Release, LightToggle };  // LightToggle: alternar la luz (no es estímulo)
 
 struct Action {
   Act act;
@@ -56,6 +63,8 @@ struct Config {
   bool autoDisarm;         // desarme automático por inactividad (autoDisarmUs); false = queda armado hasta el wiggle
   uint8_t safeClicks;      // ZONA DE SEGURIDAD: armado, los primeros N clicks seguidos en un sentido no emiten (solo
                            // wiggle); la rampa empieza en el click N+1. Reinicia al cambiar de sentido o tras rampIdle.
+  uint32_t ringMultiUs;    // anillo: separación máxima entre clicks del mismo botón para contarlos juntos (1/2/3)
+  uint8_t vibrHighPower;   // anillo: "vibrar fuerte" (doble click del botón 0)
 };
 
 Config defaults();
@@ -73,7 +82,7 @@ class Machine {
   int tick(uint32_t nowUs, Action *out, int maxOut);
 
   bool armed() const { return armed_; }
-  bool pressActive() const { return rampActive_ || tonoActive_; }
+  bool pressActive() const { return rampActive_ || tonoActive_ || ringSeq_; }
   uint8_t rampLevel() const { return ramp_; }
   const Config &config() const { return cfg_; }
 
@@ -82,6 +91,8 @@ class Machine {
   void push(Action *out, int maxOut, int &n, Act a, Mode m, uint8_t p);
   void emitPulse(Mode m, uint8_t p, Action *out, int maxOut, int &n);  // un pulso discreto = Stim + Release
   uint8_t clampPow(int p) const;
+  void ringResolve(uint32_t now, Action *out, int maxOut, int &n);  // cierra la cuenta de clicks del anillo
+  void ringStop();                                                   // corta rampa/secuencia y cuenta pendiente
 
   Config cfg_{};
   bool armed_ = false, btnDown_ = false, keyDown_ = false, tonoActive_ = false, doublePending_ = false,
@@ -96,6 +107,12 @@ class Machine {
            lastStimStart_ = 0;
   uint32_t starts_[64] = {};  // ring de inicios para el tope por minuto
   uint8_t startCount_ = 0, startHead_ = 0;
+  // Anillo: cuenta de clicks pendiente y secuencia en curso (rampa = step>0 sin límite de pulsos; doble tono = 2).
+  int8_t ringBtn_ = -1;
+  uint8_t ringCount_ = 0, ringSeqLeft_ = 0, ringSeqStep_ = 0, ringSeqPow_ = 0;
+  bool ringSeq_ = false, ringMute_ = false;
+  Mode ringSeqMode_ = Mode::Vibrar;
+  uint32_t ringLastUs_ = 0, ringSeqStart_ = 0, ringMuteStart_ = 0;
 };
 
 }  // namespace gesture

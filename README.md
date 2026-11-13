@@ -25,6 +25,27 @@ decodificó de mi propio collar (2-FSK 433.92 MHz, ±12.7 kHz, bit de 104.2 µs)
 | KEY toque / mantener | Vibrar / tono repetido |
 | KEY + botón 1.5 s (desarmado) | Enciende la pantalla y abre el menú |
 
+### Anillo Ring01 (control remoto BLE)
+
+Un anillo BLE HID de 3 botones ("Ring01") funciona como control remoto **mientras el T-Embed está armado**:
+
+| Botón del anillo | 1 click | 2 clicks | 3 clicks |
+|---|---|---|---|
+| 1 (vibrar) | vibrar (nivel "Vibrar") | vibrar fuerte ("Vibrar fuerte") | rampa de vibrar |
+| 2 (shock) | shock BAJO | shock ALTO | rampa de shock |
+| 3 (sonido) | tono | doble tono | enciende / apaga la luz |
+
+- **Emparejar:** menú → *Emparejar anillo* (o `ring pair`), con el anillo encendido y **no** conectado al teléfono.
+  Después se reconecta solo. El BLE queda apagado mientras no haya un anillo emparejado.
+- **Botones:** menú → *Botones anillo* (o `ring learn`). El anillo no dice qué botón se apretó: manda reportes HID
+  que cambian con su modo (TikTok / música / foto), así que el asistente pide un click y un doble click de cada
+  botón en cada uno de los 3 modos y guarda la "firma" de cada uno. Los 3 modos quedan como **el mismo botón**:
+  cambiar de modo sin querer no cambia lo que hace. Una ráfaga de reportes no aprendida no hace nada.
+- La rampa del anillo es automática (un pulso por cadencia, +PASO, máximo 5 s) y la corta **cualquier** entrada:
+  un click del anillo, la rueda, el botón, la KEY, o que se caiga el enlace.
+- Pasa por las mismas barreras que los gestos locales (armado, cadencia, tope por minuto, TOPE, interruptor de
+  shock). Los clicks del anillo cuentan como actividad para el desarme automático.
+
 - **Pantalla apagada por defecto** (backlight y panel en sleep). El menú (LVGL 9) muestra estado, controla la
   **luz** del collar (encender/apagar, modo 1-3) y edita: cadencia, rampa mín/máx (TOPE), vibrar, shock
   BAJO/ALTO, sensibilidad de armado, pausa de gracia, zona de seguridad, paso de rampa, desarme automático
@@ -34,12 +55,33 @@ decodificó de mi propio collar (2-FSK 433.92 MHz, ±12.7 kHz, bit de 104.2 µs)
 - **Shock:** doble barrera. `ALLOW_SHOCK` en compilación (techo) + interruptor `shock on|off` **solo por
   serial** (no en la GUI), persistente en NVS. Apagado → todo shock sale como vibrar.
 
+## Energía
+
+| Estado | CPU | CC1101 | BLE (anillo) |
+|---|---|---|---|
+| Armado | 80 MHz, `loop()` cede el núcleo (2 ms) | IDLE | encendido: conectado, o buscando al anillo |
+| Menú abierto | 160 MHz | dormido | encendido (emparejar / asistente) |
+| Desarmado | 80 MHz, sondeo cada 5 ms | dormido (SPWD) | **apagado** (controlador incluido) |
+| Desarmado 20 s sin tocar | light sleep (despierta con rueda / botón / KEY) | dormido | apagado |
+| Desarmado 5 min sin tocar | deep sleep, placa cortada (despierta con KEY, reinicia) | apagado | apagado |
+
+- 80 MHz es el piso: por debajo el APB deja de ser 80 MHz y se rompe el timing de la trama (RMT) y el BLE. Solo
+  se sube a 240 MHz alrededor de la medición de los comandos de banco (`tx`, `txramp`).
+- El anillo solo actúa con el equipo armado, así que el BLE se enciende al armar (conecta en ~3–8 s; dos tonos
+  agudos avisan) y se apaga al desarmar. Buscando un anillo apagado: 20 s a ciclo alto y después 40 ms cada 500 ms.
+- No duerme con el USB conectado a un computador (el light sleep corta el puerto serie). `sleep [on|off|now]`.
+- `pwr` muestra batería, corriente (fuel-gauge BQ27220) y frecuencia de CPU; el menú muestra la batería arriba.
+- Con el desarme automático apagado el equipo queda armado (y despierto, con el BLE encendido) hasta el wiggle.
+
 ## Estructura
 
 ```
 lib/t60frame/   tramas T60 (preámbulo, sync, ID, seq/modo/potencia, Sum8) → corridas para el RMT
 lib/gesture/    máquina de gestos y armado — lógica pura, sin Arduino
 lib/settings/   tabla de ajustes del menú + carga/guardado (NVS detrás de una interfaz)
+lib/bq27220/    driver del fuel-gauge BQ27220 (LilyGO), solo lectura
+lib/ringmap/    reportes HID del anillo → clicks de botón (firmas aprendidas) — lógica pura
+src/ring.cpp    enlace BLE con el anillo (central: escaneo, emparejado, suscripción a reportes HID)
 src/main.cpp    driver CC1101 (TX 2-FSK asíncrono por GDO0 + RMT), encoder PCNT, tarea de TX, UI LVGL, comandos
 src/lcd.h       configuración LovyanGFX del ST7789V
 test/           pruebas host (Unity): tramas vs referencia, invariantes de seguridad + fuzz + mutación, ajustes
@@ -86,6 +128,8 @@ versión vieja.
 | `set <campo> <valor>` | ajuste en vivo (no se guarda) |
 | `menu [save\|exit]`, `nvs [clear]` | menú y ajustes guardados |
 | `shock [on\|off]` | interruptor de shock |
+| `pwr`, `sleep [on\|off\|now]` | batería / corriente / CPU; auto-sleep por inactividad |
+| `ring [pair\|forget\|learn\|next\|clear\|log\|click <1-3>]` | anillo: estado, emparejar, asistente de botones, reportes crudos, click simulado |
 | `tx <luz\|tono\|vibrar\|shock> <0-99>` | una pulsación de prueba (mide y decodifica lo transmitido en el pad) |
 | `cap [s]`, `beep`, `lcd`, `wdtest` | medición de entradas, parlante, pantalla, watchdog |
 

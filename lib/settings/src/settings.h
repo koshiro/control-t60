@@ -18,7 +18,7 @@ struct Field {
   int32_t min, max, step;  // en unidades de pantalla (ms o nivel)
 };
 
-constexpr int kCount = 12;
+constexpr int kCount = 14;
 constexpr int32_t kSchema = 1;  // sube si cambia el significado de una clave → lo guardado se ignora
 
 const Field &field(int i);

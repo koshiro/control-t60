@@ -37,7 +37,7 @@ static void assertSafe(const gesture::Config &c) {
   }
   TEST_ASSERT_TRUE(c.minStimGapUs >= 500000);
   TEST_ASSERT_TRUE(c.lowPower <= c.cap && c.highPower <= c.cap && c.minRamp <= c.cap);
-  TEST_ASSERT_TRUE(c.keyVibrPower <= c.cap && c.keyTonoPower <= c.cap);
+  TEST_ASSERT_TRUE(c.keyVibrPower <= c.cap && c.keyTonoPower <= c.cap && c.vibrHighPower <= c.cap);
 }
 
 // Abrir el menú y guardar sin tocar nada no debe cambiar la config.

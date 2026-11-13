@@ -16,6 +16,7 @@
 #include <SPI.h>
 #include <driver/rmt_tx.h>
 #include <esp_random.h>
+#include <esp_system.h>
 #include <soc/gpio_reg.h>
 #include <soc/io_mux_reg.h>
 #include <xtensa/core-macros.h>
@@ -28,13 +29,21 @@
 #include <driver/i2s_std.h>
 #include <driver/pulse_cnt.h>
 
+#include <driver/gpio.h>    // gpio_wakeup_enable (wake por flanco en light sleep)
+#include <driver/rtc_io.h>  // rtc_gpio_pullup_en (wake ext1 en deep sleep)
+#include <esp_sleep.h>      // light/deep sleep (fases 3 y 4 de power)
+
 #include "gesture.h"
 #include "lcd.h"
+#include "ring.h"
+#include "ringmap.h"
 #include "settings.h"
 
 #include <Preferences.h>
 #include <lvgl.h>
 #include "t60frame.h"
+
+#include <bq27220.h>  // fuel-gauge BQ27220 (I2C 0x55, SDA=8/SCL=18): medición de batería/consumo (fase 0 de power)
 
 #ifndef FW_VERSION
 #define FW_VERSION "sin-version"  // lo define tools/build_env.py (git describe)
@@ -73,7 +82,7 @@ enum : uint8_t {
   IOCFG2 = 0x00, IOCFG0 = 0x02, PKTCTRL0 = 0x08, FREQ2 = 0x0D, FREQ1 = 0x0E, FREQ0 = 0x0F,
   MDMCFG4 = 0x10, MDMCFG3 = 0x11, MDMCFG2 = 0x12, DEVIATN = 0x15, MCSM0 = 0x18, FREND0 = 0x22,
   FSCAL3 = 0x23, FSCAL2 = 0x24, FSCAL1 = 0x25, PATABLE = 0x3E,
-  SRES = 0x30, STX = 0x35, SIDLE = 0x36,
+  SRES = 0x30, STX = 0x35, SIDLE = 0x36, SPWD = 0x39,  // SPWD: power-down (SLEEP, ~200 nA; registros retenidos)
   PARTNUM = 0x30, VERSION = 0x31, MARCSTATE = 0x35,
 };
 static constexpr uint8_t MARC_IDLE = 0x01, MARC_TX = 0x13;
@@ -127,6 +136,9 @@ static SemaphoreHandle_t g_spiLock;
 static SemaphoreHandle_t g_rfMutex;
 static inline void rfLock() { xSemaphoreTake(g_rfMutex, portMAX_DELAY); }
 static inline void rfUnlock() { xSemaphoreGive(g_rfMutex); }
+// Fase 2 (power): espejo del estado de armado visible desde transmitRuns() (g_m se define más abajo). Con el
+// control DESARMADO el CC1101 duerme (SPWD); al terminar una TX de banco se vuelve a dormir.
+static volatile bool g_armed = false;
 
 // ---------------------------------------------------------------- driver CC1101 (base: capturador/src/main.cpp)
 static void csLow() {
@@ -179,6 +191,11 @@ static void cc1101Config() {
   waitMarc(MARC_IDLE, 50);
 }
 
+// Fase 2 (power): dormir/despertar el CC1101 según armado. En SLEEP los registros se retienen, así que al
+// despertar basta SIDLE (no hace falta re-config). Llamar con g_rfMutex tomado (o en setup, antes de las tareas).
+static void cc1101Sleep() { strobe(SIDLE); strobe(SPWD); }           // ~200 nA
+static void cc1101Wake() { strobe(SIDLE); waitMarc(MARC_IDLE, 50); } // vuelve a IDLE (~1.6 mA)
+
 // ---------------------------------------------------------------- RMT (dato TX en GDO0)
 static rmt_channel_handle_t g_rmt;
 static rmt_encoder_handle_t g_copy;
@@ -214,7 +231,16 @@ static inline uint32_t gdo0Level() { return (REG_READ(GPIO_IN_REG) >> PIN_GDO0) 
 static constexpr uint16_t LEAD_TICKS = 20000;
 
 static void toSymbols(const t60::Run *runs, int n, std::vector<rmt_symbol_word_t> &out) {
-  std::vector<std::pair<uint8_t, uint16_t>> halves{{0, LEAD_TICKS}};
+  // Reservar el tamaño exacto de una (precontando las mitades por corrida, ceil(t/30000) cada una) en vez de
+  // dejar crecer el vector a saltos: el realloc por duplicación necesita old+new contiguos a la vez y con el
+  // heap fragmentado (bloque interno mayor ~32 KB) reventaba a partir de 3 tramas con bad_alloc. 1 sola
+  // asignación del tamaño final cae holgada. (5-6 tramas igual no entran en el bloque → límite de heap aparte.)
+  size_t nh = 1;  // la mitad inicial del preámbulo en bajo (LEAD_TICKS)
+  for (int i = 0; i < n; i++) nh += (runs[i].tenthsUs + 29999) / 30000;
+  nh += 2;  // margen: posible partición de paridad + el ajuste de −2 ticks
+  std::vector<std::pair<uint8_t, uint16_t>> halves;
+  halves.reserve(nh);
+  halves.push_back({0, LEAD_TICKS});
   for (int i = 0; i < n; i++) {
     uint32_t t = runs[i].tenthsUs;  // décimas de µs = ticks a 10 MHz
     while (t > 0) {
@@ -230,6 +256,7 @@ static void toSymbols(const t60::Run *runs, int n, std::vector<rmt_symbol_word_t
     halves.push_back({last.first, (uint16_t)(last.second - last.second / 2)});
   }
   out.clear();
+  out.reserve(nh / 2 + 1);
   for (size_t i = 0; i < halves.size(); i += 2) {
     rmt_symbol_word_t s;
     s.level0 = halves[i].first;
@@ -291,7 +318,7 @@ static int capture(uint32_t limitUs, uint32_t &t0) {
     uint32_t lv = gdo0Level();
     if (now - prev > g_maxSampleGap) g_maxSampleGap = now - prev;
     if (lv != last) {
-      if (n < MAX_EDGES) g_edges[n] = {prev, now};
+      if (g_edges && n < MAX_EDGES) g_edges[n] = {prev, now};
       n++;
       last = lv;
     }
@@ -386,7 +413,8 @@ static void report(const t60::Run *runs, int nRuns, int nEdges, int framesSent) 
 
 // ---------------------------------------------------------------- TX
 static uint8_t g_seq;
-static t60::Run g_runs[8000];
+static constexpr int RUNS_CAP = 8000;
+static t60::Run *g_runs;  // 64 KB: en PSRAM (setup) para dejar la RAM interna al BLE
 static std::vector<rmt_symbol_word_t> g_syms;
 
 static bool modeFromName(const char *s, uint8_t &mode) {
@@ -402,6 +430,9 @@ static bool modeFromName(const char *s, uint8_t &mode) {
 // Envía las corridas ya construidas en g_runs[0..n). `wdMs` = 0 → watchdog normal (duración + 200 ms);
 // >0 → forzado (wdtest). `doReport` → mide en el pad y decodifica lo transmitido. `framesSent` solo informa.
 static void transmitRuns(int n, uint32_t wdMs, bool doReport, int framesSent) {
+  // Buffer de medición (65 KB) solo para los comandos de banco: reservarlo siempre dejaba sin RAM al BLE del anillo.
+  if (doReport && !g_edges) g_edges = (Edge *)heap_caps_malloc(MAX_EDGES * sizeof(Edge), MALLOC_CAP_INTERNAL);
+  if (doReport && !g_edges) { Serial.println("AVISO sin RAM para medir: se transmite sin reporte"); doReport = false; }
   toSymbols(g_runs, n, g_syms);
   double totalUs = 0;
   for (int i = 0; i < n; i++) totalUs += g_runs[i].tenthsUs / 10.0;
@@ -445,12 +476,13 @@ static void transmitRuns(int n, uint32_t wdMs, bool doReport, int framesSent) {
                 g_wdFired ? "(watchdog)" : String(marcEnd, HEX).c_str(), idle ? "IDLE" : "NO-IDLE", (unsigned)lvl,
                 g_wdFired ? "DISPARÓ" : "no", done ? "completo" : "cortado");
   if (doReport) report(g_runs, n, nEdges, framesSent);
+  if (!g_armed) strobe(SPWD);  // Fase 2: TX de banco (desarmado) → volver a dormir el CC1101
 }
 
 // Una pulsación completa de potencia fija. `wdMs` = 0 → watchdog normal; >0 → forzado (wdtest).
 static void transmit(t60::Frame f, int frames, uint32_t wdMs) {
   rfLock();
-  int n = t60::pressRuns(f, frames, true, g_runs, sizeof g_runs / sizeof g_runs[0]);
+  int n = t60::pressRuns(f, frames, true, g_runs, RUNS_CAP);
   if (n < 0) { rfUnlock(); Serial.println("ERR no caben las corridas"); return; }
   Serial.printf("TX seq=0x%02X modo=0x%02X potencia=%u tramas=%d+soltar chkXor=0x%02X id=%02X%02X\n", f.seq, f.mode,
                 f.power, frames, f.chkXor, f.idHi, f.idLo);
@@ -483,7 +515,10 @@ static void cmdTx(int argc, char **argv) {
     if (!strcmp(argv[i], "badid")) f.idLo = t60::kIdLo ^ 0x01;  // ID vecino: otro collar
   }
   g_seq += 2;  // tramas con seq, soltar con seq+1
+  uint32_t prevFreq = getCpuFrequencyMhz();  // subir a 240 solo para que capture()/report mida con resolución
+  if (prevFreq < 240) setCpuFrequencyMhz(240);
   transmit(f, frames, 0);
+  if (prevFreq < 240) setCpuFrequencyMhz(prevFreq);
 }
 
 // Prueba del punto 3: una sola pulsación (mismo seq) con la potencia cambiando entre niveles → ver si el
@@ -513,13 +548,16 @@ static void cmdTxRamp(int argc, char **argv) {
     return;
   }
   rfLock();
-  int n = t60::rampRuns(g_seq, mode, powers, np, per, true, g_runs, sizeof g_runs / sizeof g_runs[0]);
+  int n = t60::rampRuns(g_seq, mode, powers, np, per, true, g_runs, RUNS_CAP);
   if (n < 0) { rfUnlock(); Serial.println("ERR no caben las corridas"); return; }
   Serial.printf("TXRAMP seq=0x%02X modo=0x%02X %dx%d tramas + soltar, potencias:", g_seq, mode, np, per);
   for (int i = 0; i < np; i++) Serial.printf(" %u", powers[i]);
   Serial.println();
   g_seq += 2;
+  uint32_t prevFreq = getCpuFrequencyMhz();  // subir a 240 solo para que capture()/report mida con resolución
+  if (prevFreq < 240) setCpuFrequencyMhz(240);
   transmitRuns(n, 0, true, np * per);
+  if (prevFreq < 240) setCpuFrequencyMhz(prevFreq);
   rfUnlock();
 }
 
@@ -550,7 +588,7 @@ static void cmdTxRate(int argc, char **argv) {
     f.power = power;
     g_seq += 2;
     rfLock();
-    int n = t60::pressRuns(f, 1, true, g_runs, sizeof g_runs / sizeof g_runs[0]);
+    int n = t60::pressRuns(f, 1, true, g_runs, RUNS_CAP);
     if (n >= 0) transmitRuns(n, 0, false, 1);
     rfUnlock();
     if (n < 0) { Serial.println("ERR no caben las corridas"); return; }
@@ -589,7 +627,7 @@ static void cmdTxTight(int argc, char **argv) {
     g_seq += 2;
     bool last = (i == count - 1);
     rfLock();
-    int n = t60::pressRuns(f, 1, last, g_runs, sizeof g_runs / sizeof g_runs[0]);  // soltar solo en el último
+    int n = t60::pressRuns(f, 1, last, g_runs, RUNS_CAP);  // soltar solo en el último
     if (n >= 0) transmitRuns(n, 0, false, 1);
     rfUnlock();
     if (n < 0) { Serial.println("ERR no caben las corridas"); return; }
@@ -664,6 +702,8 @@ static void cmdCap(int argc, char **argv) {
   const double cpm = getCpuFrequencyMhz();
   Serial.printf("CAP %u s — hacé el gesto ahora. Pines activos en bajo: A=%d B=%d BTN=%d KEY=%d\n", secs,
                 PIN_ENC_A, PIN_ENC_B, PIN_ENC_BTN, PIN_KEY);
+  g_enc = (EncT *)heap_caps_malloc(MAX_ENC * sizeof(EncT), MALLOC_CAP_INTERNAL);  // solo durante la captura
+  if (!g_enc) { Serial.println("ERR sin RAM para la captura"); return; }
   disableLoopWDT();
   uint32_t n = 0, t0 = XTHAL_GET_CCOUNT();
   uint8_t last = encNib();
@@ -688,6 +728,8 @@ static void cmdCap(int argc, char **argv) {
                   (x >> 3) & 1);
   }
   Serial.println("CAP fin");
+  free(g_enc);
+  g_enc = nullptr;
 }
 
 static void cmdLog();    // definidos en la sección de gestos (fase 5), más abajo
@@ -698,7 +740,12 @@ static void cmdLcd();
 static void cmdMenu(int argc, char **argv);
 static void cmdNvs(int argc, char **argv);
 static void cmdShock(int argc, char **argv);
+static void cmdPwr();
+static void uiUpdateBattery();  // refresca el indicador de batería del menú (definido tras cmdPwr/g_gauge)
+static void cmdSleep(int argc, char **argv);
 static void pollCombo(uint32_t now);
+static void cmdRing(int argc, char **argv);
+static void lightSend(uint8_t power);
 
 static void handle(char *line) {
   char *argv[8];
@@ -706,7 +753,9 @@ static void handle(char *line) {
   for (char *tok = strtok(line, " \t"); tok && argc < 8; tok = strtok(nullptr, " \t")) argv[argc++] = tok;
   if (!argc) return;
   if (!strcmp(argv[0], "ping"))
-    Serial.printf("PONG control-t60 0x%02X 0x%02X %s\n", readStatus(PARTNUM), readStatus(VERSION), FW_VERSION);
+    Serial.printf("PONG control-t60 0x%02X 0x%02X %s | reset=%d uptime=%lu s heap=%u psram=%u\n", readStatus(PARTNUM),
+                  readStatus(VERSION), FW_VERSION, (int)esp_reset_reason(), (unsigned long)(millis() / 1000),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   else if (!strcmp(argv[0], "ver")) Serial.printf("VER %s\n", FW_VERSION);  // = git describe del build
   else if (!strcmp(argv[0], "regs")) cmdRegs();
   else if (!strcmp(argv[0], "tx")) cmdTx(argc, argv);
@@ -722,8 +771,11 @@ static void handle(char *line) {
   else if (!strcmp(argv[0], "menu")) cmdMenu(argc, argv);
   else if (!strcmp(argv[0], "nvs")) cmdNvs(argc, argv);
   else if (!strcmp(argv[0], "shock")) cmdShock(argc, argv);
+  else if (!strcmp(argv[0], "ring")) cmdRing(argc, argv);
+  else if (!strcmp(argv[0], "pwr")) cmdPwr();
+  else if (!strcmp(argv[0], "sleep")) cmdSleep(argc, argv);
   else if (!strcmp(argv[0], "beep")) { beep(argc > 1 ? atoi(argv[1]) : 1800, argc > 2 ? atoi(argv[2]) : 150); Serial.println("BEEP"); }
-  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock beep");
+  else Serial.println("ERR comandos: ping ver regs tx txramp txrate txtight wdtest cap log gstat set lcd menu nvs shock ring pwr sleep beep");
 }
 
 // ================================================================ Fase 5: control por gestos
@@ -740,6 +792,9 @@ static Action g_actBuf[16];
 static uint32_t g_lastN;
 static Mode g_lastReq = Mode::None, g_lastSent = Mode::None;
 static uint8_t g_lastPow;
+static bool g_ringMon;            // `ring mon on`: imprime cada reporte del anillo y cada decisión en vivo por serial
+static int32_t g_lightMode = 1;   // modo de luz elegido (1-3, se guarda con "Guardar"); 1 = el único verificado
+static bool g_lightOn;            // último estado ORDENADO (el collar no informa el suyo); arranca apagado
 
 static uint8_t collarMode(Mode m) {  // gesture::Mode → byte de modo del collar (canal 1)
   switch (m) {
@@ -778,7 +833,7 @@ static void sendFrame(uint8_t seq, uint8_t mode, uint8_t power, bool release) {
   f.seq = seq;
   f.mode = mode;
   f.power = power;
-  int n = t60::pressRuns(f, 1, release, g_runs, sizeof g_runs / sizeof g_runs[0]);
+  int n = t60::pressRuns(f, 1, release, g_runs, RUNS_CAP);
   if (n > 0) transmitRuns(n, 0, false, 1);
   uint32_t t2 = micros();
   rfUnlock();
@@ -802,10 +857,16 @@ static void txTask(void *) {
 // Con el interruptor de shock apagado (o ALLOW_SHOCK=0), shock→vibrar (gesture::effectiveMode).
 static void dispatch(Action *a, int n) {
   for (int i = 0; i < n; i++) {
+    if (a[i].act == Act::LightToggle) {  // anillo, 3 clicks del botón de sonido: alterna la luz (no es estímulo)
+      g_lightOn = !g_lightOn;
+      lightSend(g_lightOn ? (uint8_t)g_lightMode : 0);
+      continue;
+    }
     if (a[i].act != Act::Stim) continue;  // el Release del par no genera trama aparte (pressRuns ya la agrega)
     Mode gm = gesture::effectiveMode(a[i].mode, shockEnabled());
     uint8_t mode = collarMode(gm), power = a[i].power;
     logAdd('D', 0, mode, power);
+    if (g_ringMon) Serial.printf("TXQ %lu modo=0x%02X pot=%u\n", (unsigned long)millis(), mode, power);
     g_lastReq = a[i].mode;
     g_lastSent = gm;
     g_lastPow = power;
@@ -854,6 +915,8 @@ static void encoderInit() {
 
 // --- modo menú (fase 3): con el menú abierto, encoder y botones van a LVGL y NO a la máquina de gestos ---
 static bool g_inMenu;
+static uint32_t g_lastInputMs;  // millis() de la última entrada (encoder/botón) → inactividad para el auto-sleep
+static bool g_autoSleep = true;  // auto light/deep sleep por inactividad (ajuste persistente, Preferences "autoslp")
 static int32_t g_menuDiff;  // muescas pendientes para LVGL (+ = derecha = siguiente/subir)
 static lv_group_t *g_grp;   // grupo de foco del menú (se crea en uiInit)
 static void menuButton(int pin, bool down);
@@ -873,6 +936,7 @@ static void pollEncoder(uint32_t now) {
   int cnt = 0;
   pcnt_unit_get_count(g_pcnt, &cnt);
   int delta = cnt - g_lastCount;
+  if (delta >= COUNTS_PER_DETENT || delta <= -COUNTS_PER_DETENT) g_lastInputMs = millis();  // actividad (auto-sleep)
   while (delta >= COUNTS_PER_DETENT) {
     g_lastCount += COUNTS_PER_DETENT;
     delta -= COUNTS_PER_DETENT;
@@ -898,6 +962,7 @@ static void pollBtn(Btn &b, In downEv, In upEv, uint32_t now) {
   if (raw != b.lastRaw) { b.lastRaw = raw; b.tEdge = now; }
   if (b.pressed != raw && (uint32_t)(now - b.tEdge) >= g_m.config().debounceUs) {
     b.pressed = raw;
+    g_lastInputMs = millis();  // actividad (auto-sleep)
     if (g_inMenu) { menuButton(b.pin, raw); return; }
     In ev = raw ? downEv : upEv;
     logAdd('I', (uint8_t)ev, 0, 0);
@@ -967,6 +1032,10 @@ static void pollGestures() {
   bool armedNow = g_m.armed();
   if (armedNow != prevArmed) {  // confirmación LOCAL (no al collar): armar = beep agudo, desarmar = grave
     beep(armedNow ? 1800 : 500, armedNow ? 120 : 200);
+    g_armed = armedNow;
+    rfLock();  // Fase 2: armar → CC1101 a IDLE (pulsos instantáneos); desarmar → SPWD (~200 nA)
+    if (armedNow) cc1101Wake(); else cc1101Sleep();
+    rfUnlock();
     prevArmed = armedNow;
   }
   updateLed();
@@ -993,9 +1062,6 @@ enum MenuReq : uint8_t { REQ_NONE, REQ_SAVE, REQ_EXIT };
 static MenuReq g_menuReq;         // lo piden los callbacks de LVGL; se atiende fuera de lv_timer_handler (lock)
 static gesture::Config g_edit;    // copia que edita el menú; solo se aplica al guardar
 static int g_nvsFound = -1;       // campos leídos de la NVS al arrancar (para `nvs`)
-static int32_t g_lightMode = 1;   // modo de luz elegido (1-3, se guarda con "Guardar"); 1 = el único verificado
-static bool g_lightOn;            // último estado ORDENADO (el collar no informa el suyo); arranca apagado
-
 static const char *modeName(Mode m) {
   switch (m) {
     case Mode::Shock: return "shock";
@@ -1039,6 +1105,14 @@ static lv_display_t *g_disp;
 static uint8_t g_lvBuf[320 * 24 * 2];  // buffer parcial: 24 líneas
 static lv_obj_t *g_sl[settings::kCount], *g_val[settings::kCount], *g_hdr, *g_hdrState, *g_hdrInfo;
 static lv_obj_t *g_lightSw, *g_lightDd, *g_noteShock;
+static lv_obj_t *g_ringLbl, *g_wiz, *g_wizLbl;  // estado del anillo en el menú · pantalla del asistente de botones
+static void onRingPair(lv_event_t *);
+static void onRingLearn(lv_event_t *);
+static bool learnActive();
+static void learnButton(int pin, bool down);
+static void learnAbort();
+static void uiUpdateRing();
+static lv_obj_t *g_batLabel;  // indicador de batería (primera fila del menú); lo refresca uiUpdateBattery()
 
 static void lvFlush(lv_display_t *d, const lv_area_t *a, uint8_t *px) {
   uint32_t w = lv_area_get_width(a), h = lv_area_get_height(a);
@@ -1050,9 +1124,9 @@ static void lvFlush(lv_display_t *d, const lv_area_t *a, uint8_t *px) {
 }
 
 static void lvEncRead(lv_indev_t *, lv_indev_data_t *d) {
-  d->enc_diff = (int16_t)g_menuDiff;
+  d->enc_diff = learnActive() ? 0 : (int16_t)g_menuDiff;  // con el asistente abierto el menú de atrás no se mueve
   g_menuDiff = 0;
-  d->state = g_menuBtn ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  d->state = g_menuBtn && !learnActive() ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 static void fmtValue(int i, int32_t v, char *buf, size_t n) {
@@ -1211,6 +1285,14 @@ static void uiBuild() {
   lv_style_set_bg_opa(&rowSel, LV_OPA_COVER);
   lv_style_set_bg_color(&rowSel, lv_color_hex(0x1E3A40));
 
+  // Indicador de batería: primera fila, siempre visible al abrir (el menú arranca con scroll arriba). No entra al
+  // grupo de foco → el encoder lo salta; es solo lectura. Lo llena uiUpdateBattery() desde el gauge BQ27220.
+  g_batLabel = lv_label_create(list);
+  lv_obj_set_style_text_font(g_batLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_pad_left(g_batLabel, 8, 0);
+  lv_obj_set_style_pad_ver(g_batLabel, 2, 0);
+  lv_label_set_text(g_batLabel, "Bateria: --");
+
   {  // fila de luz (acción inmediata, no es un ajuste de gestos): Luz [interruptor] [modo]
     lv_obj_t *row = lv_obj_create(list);
     lv_obj_add_style(row, &rowSt, 0);
@@ -1281,6 +1363,23 @@ static void uiBuild() {
     lv_obj_set_style_text_color(val, lv_color_white(), 0);
     g_val[i] = val;
   }
+  {  // anillo: estado + emparejar + asistente de botones
+    g_ringLbl = lv_label_create(list);
+    lv_obj_set_style_text_font(g_ringLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_ringLbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_pad_left(g_ringLbl, 8, 0);
+    lv_obj_set_style_pad_top(g_ringLbl, 4, 0);
+    lv_label_set_text(g_ringLbl, "Anillo: -");
+    lv_obj_t *row = lv_obj_create(list);
+    lv_obj_add_style(row, &rowSt, 0);
+    lv_obj_set_style_pad_hor(row, 2, 0);
+    lv_obj_set_style_pad_ver(row, 2, 0);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    mkButton(row, "Emparejar anillo", lv_color_hex(0x283593), onRingPair);
+    mkButton(row, "Botones anillo", lv_color_hex(0x283593), onRingLearn);
+  }
   g_noteShock = lv_label_create(list);  // estado del interruptor de shock (texto lo pone uiUpdateHeader)
   lv_obj_set_style_text_font(g_noteShock, &lv_font_montserrat_12, 0);
   lv_obj_set_style_pad_left(g_noteShock, 8, 0);
@@ -1295,6 +1394,22 @@ static void uiBuild() {
   mkButton(btns, "Guardar", lv_palette_darken(LV_PALETTE_GREEN, 2), onSave);
   mkButton(btns, "Salir", lv_color_hex(0x455A64), onExit);
   mkButton(btns, "Fabrica", lv_color_hex(0x5D4037), onDefaults);
+
+  // asistente de botones del anillo: tapa todo el menú con un texto grande (oculto hasta que se abre)
+  g_wiz = lv_obj_create(scr);
+  lv_obj_set_size(g_wiz, 320, 170);
+  lv_obj_set_pos(g_wiz, 0, 0);
+  lv_obj_set_style_radius(g_wiz, 0, 0);
+  lv_obj_set_style_border_width(g_wiz, 0, 0);
+  lv_obj_set_style_bg_color(g_wiz, lv_color_hex(0x0D1B2A), 0);
+  lv_obj_remove_flag(g_wiz, LV_OBJ_FLAG_SCROLLABLE);
+  g_wizLbl = lv_label_create(g_wiz);
+  lv_obj_set_width(g_wizLbl, 300);
+  lv_label_set_long_mode(g_wizLbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(g_wizLbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(g_wizLbl, lv_color_white(), 0);
+  lv_obj_center(g_wizLbl);
+  lv_obj_add_flag(g_wiz, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void uiInit() {
@@ -1330,6 +1445,7 @@ static void menuOpen() {
   if (!g_lcdOk || g_inMenu || g_m.armed()) return;
   g_edit = g_m.config();
   settings::normalize(g_edit);
+  setCpuFrequencyMhz(160);  // LVGL fluido solo mientras el menú está abierto; al cerrar vuelve a 80 MHz
   g_inMenu = true;  // desde aquí encoder y botones van a LVGL
   g_menuMask = true;
   g_menuBtn = false;
@@ -1338,6 +1454,7 @@ static void menuOpen() {
   g_menuActivity = millis();
   uiLoadValues();
   uiUpdateHeader();
+  uiUpdateBattery();  // lectura inmediata al abrir; pollUi la refresca cada 3 s
   lv_dropdown_set_selected(g_lightDd, g_lightMode - 1);
   if (g_lightOn) lv_obj_add_state(g_lightSw, LV_STATE_CHECKED);
   else lv_obj_remove_state(g_lightSw, LV_STATE_CHECKED);
@@ -1354,6 +1471,7 @@ static void menuOpen() {
 
 static void menuClose(bool save) {
   if (!g_inMenu) return;
+  learnAbort();  // asistente de botones a medias: se descarta (queda la tabla anterior)
   bool ok = true;
   if (save) {
     settings::normalize(g_edit);
@@ -1369,6 +1487,7 @@ static void menuClose(bool save) {
   lcdPower(false);
   lcdUnlock();
   rgbLedWrite(14, 0, 0, 0);
+  setCpuFrequencyMhz(80);
   if (save && ok) { beep(1500, 60); delay(40); beep(2000, 80); }
   else if (save) beep(300, 400);  // falló la NVS
   else beep(700, 80);
@@ -1383,6 +1502,7 @@ static void menuButton(int pin, bool down) {
     if (!g_btnEnc.pressed && !g_btnKey.pressed) { g_menuMask = false; g_menuDiff = 0; }
     return;
   }
+  if (learnActive()) { learnButton(pin, down); return; }  // asistente: rueda = saltar/seguir, KEY = cancelar
   if (pin == PIN_ENC_BTN) g_menuBtn = down;
   else if (pin == PIN_KEY && down) g_menuReq = REQ_EXIT;
 }
@@ -1411,6 +1531,9 @@ static void pollUi() {
   if (millis() - last < 5) return;
   last = millis();
   uiUpdateHeader();
+  uiUpdateRing();
+  static uint32_t lastBat;
+  if (millis() - lastBat > 3000) { lastBat = millis(); uiUpdateBattery(); }
   if (!lcdLock()) return;  // TX en curso → reintentar en la próxima vuelta
   lv_timer_handler();
   lcdUnlock();
@@ -1530,6 +1653,408 @@ static void cmdSet(int argc, char **argv) {
   cmdGstat();
 }
 
+// ================================================================ Anillo Ring01 (BLE HID) como control remoto
+// ring.cpp entrega reportes HID crudos; aquí se juntan en ráfagas, se traducen a clicks de botón con las firmas
+// aprendidas (lib/ringmap) y se alimentan a la máquina de gestos como In::Ring. La máquina aplica las mismas
+// barreras que a los gestos locales (armado, cadencia, tope por minuto, TOPE, interruptor de shock).
+// Los tres modos del anillo (TikTok/música/foto) se aprenden como el MISMO botón: cambiar de modo no cambia nada.
+static ringmap::Table g_ringTbl;
+static ringmap::Burst g_ringBurst;
+static ring::Report g_ringLog[64];  // últimos reportes crudos, para `ring log`
+static uint32_t g_ringLogN;
+
+static const char *const kRingBtn[3] = {"1 (vibrar)", "2 (shock)", "3 (sonido)"};
+
+// --- asistente de botones: 3 modos × 3 botones × (un click, doble click) ---
+struct LearnSt {
+  bool active;
+  enum Phase : uint8_t { Wait, Collect, ModeChange, Done } phase;
+  int step;                 // 0..17: modo = step/6, botón = (step%6)/2, clicks = step%2 + 1
+  uint32_t t0;              // millis() del inicio de la fase (timeout) o de la última ráfaga (Collect)
+  ringmap::Table tbl;       // tabla en construcción; se guarda solo al terminar
+  uint32_t first[ringmap::kMaxBurst];  // primera ráfaga del paso
+  int firstN, bursts, clicksOk;
+  bool allKnown;
+  int added, known, conflict, skipped;
+};
+static LearnSt g_learn;
+static constexpr uint32_t LEARN_STEP_MS = 15000;  // sin click en 15 s → el paso se salta
+static constexpr uint32_t LEARN_TAIL_MS = 700;    // tras la primera ráfaga, esperar más (doble click / ráfaga partida)
+
+static bool learnActive() { return g_learn.active; }
+
+static void learnShow(const char *txt) {
+  Serial.printf("ANILLO> %s\n", txt);
+  if (g_lcdOk && g_wizLbl) lv_label_set_text(g_wizLbl, txt);
+  g_menuActivity = millis();
+}
+
+static void learnPrompt() {
+  char buf[160];
+  if (g_learn.step >= 18) {
+    g_learn.phase = LearnSt::Done;
+    bool ok = g_learn.tbl.count > 0 && ring::saveTable(g_learn.tbl);
+    if (ok) g_ringTbl = g_learn.tbl;
+    snprintf(buf, sizeof buf, "%s\n%d firmas nuevas, %d ya conocidas\n%d conflictos, %d saltados\n\nPulsa la rueda",
+             ok ? "BOTONES GUARDADOS" : "NADA GUARDADO", g_learn.added, g_learn.known, g_learn.conflict,
+             g_learn.skipped);
+    beep(ok ? 2000 : 300, ok ? 120 : 400);
+  } else {
+    g_learn.phase = LearnSt::Wait;
+    g_learn.firstN = g_learn.bursts = g_learn.clicksOk = 0;
+    g_learn.allKnown = true;
+    snprintf(buf, sizeof buf, "Modo %d de 3  -  paso %d/18\n\nBoton %s\n%s\n\n(rueda = saltar, KEY = cancelar)",
+             g_learn.step / 6 + 1, g_learn.step + 1, kRingBtn[(g_learn.step % 6) / 2],
+             g_learn.step % 2 ? "DOBLE click" : "UN click");
+  }
+  g_learn.t0 = millis();
+  g_ringBurst.reset();
+  learnShow(buf);
+}
+
+static void learnAdvance() {
+  g_learn.step++;
+  if (g_learn.step < 18 && g_learn.step % 6 == 0) {  // terminó un modo: pedir el cambio de modo del anillo
+    g_learn.phase = LearnSt::ModeChange;
+    g_learn.t0 = millis();
+    learnShow("Cambia el MODO del anillo:\ntriple click al boton del medio\n\nLuego pulsa la rueda\n(KEY = cancelar)");
+    return;
+  }
+  learnPrompt();
+}
+
+static void learnStart() {
+  if (g_learn.active) return;
+  if (ring::state() != ring::State::Ready) {
+    Serial.println("ERR anillo no conectado (emparejar primero)");
+    beep(300, 300);
+    return;
+  }
+  g_learn = LearnSt{};
+  g_learn.active = true;
+  ringmap::clear(g_learn.tbl);
+  if (g_lcdOk && g_wiz) lv_obj_remove_flag(g_wiz, LV_OBJ_FLAG_HIDDEN);
+  learnPrompt();
+}
+
+static void learnClose() {
+  g_learn.active = false;
+  g_ringBurst.reset();
+  if (g_lcdOk && g_wiz) lv_obj_add_flag(g_wiz, LV_OBJ_FLAG_HIDDEN);
+  g_menuActivity = millis();
+}
+
+static void learnAbort() {
+  if (!g_learn.active) return;
+  Serial.println("ANILLO> asistente cancelado (sin cambios)");
+  learnClose();
+}
+
+static void learnSkip() {  // rueda (o `ring next`): saltar el paso / seguir tras el cambio de modo / cerrar al final
+  if (!g_learn.active) return;
+  if (g_learn.phase == LearnSt::Done) { learnClose(); return; }
+  if (g_learn.phase == LearnSt::ModeChange) { learnPrompt(); return; }
+  g_learn.skipped++;
+  beep(500, 60);
+  learnAdvance();
+}
+
+static void learnButton(int pin, bool down) {
+  if (!down) return;
+  if (pin == PIN_KEY) { learnAbort(); beep(700, 80); }
+  else learnSkip();
+}
+
+// Cierra el paso con lo que llegó: un click = la primera ráfaga; doble click = o ya se reconoce como 2 clicks de ese
+// botón (dos ráfagas simples, o una fundida), o es UNA ráfaga distinta → firma propia de doble click.
+static void learnFinishStep() {
+  uint8_t btn = (g_learn.step % 6) / 2, clicks = g_learn.step % 2 + 1;
+  ringmap::Learn r;
+  if (clicks == 2 && g_learn.allKnown && g_learn.clicksOk == 2) r = ringmap::Learn::Known;
+  else if (clicks == 2 && g_learn.bursts != 1) r = ringmap::Learn::Conflict;  // varias ráfagas raras: no se adivina
+  else r = ringmap::learn(g_learn.tbl, g_learn.first, g_learn.firstN, btn, clicks);
+  const char *txt = "?";
+  switch (r) {
+    case ringmap::Learn::Added: g_learn.added++; txt = "nueva"; break;
+    case ringmap::Learn::Known: g_learn.known++; txt = "ya conocida"; break;
+    case ringmap::Learn::Conflict: g_learn.conflict++; txt = "CONFLICTO (no distinguible)"; break;
+    default: g_learn.skipped++; txt = "no guardada"; break;
+  }
+  Serial.printf("ANILLO> paso %d: boton %s x%d -> %s (%d rafagas, %d reportes)\n", g_learn.step + 1, kRingBtn[btn],
+                clicks, txt, g_learn.bursts, g_learn.firstN);
+  bool good = r == ringmap::Learn::Added || r == ringmap::Learn::Known;
+  beep(good ? 1500 : 300, good ? 60 : 250);
+  learnAdvance();
+}
+
+static void learnBurst() {  // una ráfaga cerrada con el asistente abierto
+  g_menuActivity = millis();
+  if (g_learn.phase != LearnSt::Wait && g_learn.phase != LearnSt::Collect) return;  // cambio de modo / fin: se ignora
+  int n = g_ringBurst.size();
+  uint8_t btn = (g_learn.step % 6) / 2, got[8];
+  int c = ringmap::decode(g_learn.tbl, g_ringBurst.data(), n, got, 8);
+  bool mine = c > 0;
+  for (int i = 0; i < c && i < 8; i++) mine = mine && got[i] == btn;
+  if (mine) g_learn.clicksOk += c;
+  else g_learn.allKnown = false;
+  if (g_learn.bursts++ == 0) {
+    g_learn.firstN = n;
+    memcpy(g_learn.first, g_ringBurst.data(), n * sizeof(uint32_t));
+  }
+  g_learn.phase = LearnSt::Collect;
+  g_learn.t0 = millis();
+}
+
+static void learnTick() {
+  if (!g_learn.active) return;
+  if (ring::state() != ring::State::Ready) { learnAbort(); beep(300, 300); return; }
+  uint32_t dt = millis() - g_learn.t0;
+  if (g_learn.phase == LearnSt::Collect && dt >= LEARN_TAIL_MS && g_ringBurst.empty()) learnFinishStep();
+  else if (g_learn.phase == LearnSt::Wait && dt >= LEARN_STEP_MS) learnSkip();
+  else if ((g_learn.phase == LearnSt::ModeChange || g_learn.phase == LearnSt::Done) && dt >= 45000) learnAbort();
+}
+
+static void pollRing() {
+  static uint32_t lost;
+  static ring::State prevState = ring::State::Off;
+  // Energía: el BLE solo vive mientras sirve — ARMADO (el anillo no actúa desarmado) o con el menú abierto (emparejar
+  // / asistente). Desarmado se apaga el controlador entero; así no gasta radio y el equipo puede entrar a light sleep.
+  static bool wantBle;
+  bool want = g_m.armed() || g_inMenu;
+  if (want != wantBle) { wantBle = want; ring::setActive(want); }
+  ring::Report r;
+  while (ring::read(r)) {
+    g_ringLog[g_ringLogN++ & 63] = r;
+    if (g_ringMon) {
+      Serial.printf("RR %lu h=%04X", (unsigned long)(r.t / 1000), r.src);
+      for (int i = 0; i < r.len; i++) Serial.printf(" %02X", r.data[i]);
+      Serial.println();
+    }
+    if (ringmap::isRelease(r.data, r.len)) continue;  // "soltar" (todo ceros): no forma parte de la firma
+    g_ringBurst.add(ringmap::reportHash(r.src, r.data, r.len), r.t);
+  }
+  uint32_t now = micros();
+  ring::State st = ring::state();
+  if (st != prevState) {  // aviso local al conectar (dos tonos agudos); la desconexión se avisa abajo
+    if (st == ring::State::Ready) { beep(1600, 50); beep(2200, 70); }
+    prevState = st;
+  }
+  if (ring::lostCount() != lost) {  // enlace caído: descartar lo pendiente y cortar una rampa del anillo en curso
+    lost = ring::lostCount();
+    g_ringBurst.reset();
+    logAdd('I', (uint8_t)In::RingLost, 0, 0);
+    dispatch(g_actBuf, g_m.feed(In::RingLost, 0, now, g_actBuf, 16));
+    beep(400, 120);
+  }
+  // Ráfaga lista: por silencio, o antes si ya se reconoce sin ambigüedad (no en el asistente, que aprende completas).
+  if (g_ringBurst.closed(now) ||
+      (!g_learn.active && ringmap::settled(g_ringTbl, g_ringBurst.data(), g_ringBurst.size()))) {
+    if (g_learn.active) {
+      learnBurst();
+    } else if (!g_inMenu) {  // con el menú abierto el anillo no actúa (igual que la rueda y los botones)
+      uint8_t btn[8];
+      int n = ringmap::decode(g_ringTbl, g_ringBurst.data(), g_ringBurst.size(), btn, 8);
+      logAdd('R', (uint8_t)g_ringBurst.size(), (uint8_t)n, n > 0 ? btn[0] : 0xFF);
+      if (g_ringMon) Serial.printf("RB %lu rafaga=%d reportes -> %d clicks boton=%d armado=%d\n", (unsigned long)millis(),
+                                   g_ringBurst.size(), n, n > 0 ? btn[0] + 1 : 0, g_m.armed());
+      for (int i = 0; i < n && i < 8; i++) {
+        logAdd('I', (uint8_t)In::Ring, btn[i], 0);
+        dispatch(g_actBuf, g_m.feed(In::Ring, btn[i], now, g_actBuf, 16));
+      }
+    }
+    g_ringBurst.reset();
+  }
+  learnTick();
+}
+
+static void uiUpdateRing() {  // texto de estado del anillo en el menú (solo si cambió)
+  static char last[80];
+  char buf[80];
+  ring::PairResult pr = ring::pairResult();
+  if (pr != ring::PairResult::None && pr != ring::PairResult::Ok && ring::state() != ring::State::Ready)
+    snprintf(buf, sizeof buf, "Anillo: %s (emparejar: %s)", ring::stateName(), ring::pairResultName());
+  else snprintf(buf, sizeof buf, "Anillo: %s, %d firmas de botones", ring::stateName(), g_ringTbl.count);
+  if (!g_ringLbl || !strcmp(buf, last)) return;
+  strcpy(last, buf);
+  lv_label_set_text(g_ringLbl, buf);
+}
+static void onRingPair(lv_event_t *) {
+  ring::pair();  // el anillo debe estar encendido y sin conexión con el teléfono
+  beep(1200, 40);
+}
+static void onRingLearn(lv_event_t *) { learnStart(); }
+
+// `ring` estado · `ring pair` · `ring forget` · `ring learn` / `ring next` (asistente de botones; next = saltar o
+// seguir, como la rueda) · `ring clear` (borra las firmas) · `ring log` (reportes crudos) · `ring click <1-3>`
+// (inyecta un click de ese botón: prueba los gestos sin el anillo; pasa por las mismas barreras).
+static void cmdRing(int argc, char **argv) {
+  const char *sub = argc > 1 ? argv[1] : "";
+  if (!strcmp(sub, "pair")) { ring::pair(); Serial.println("RING emparejando (8 s): anillo encendido y sin conexion con el telefono"); return; }
+  if (!strcmp(sub, "forget")) { ring::forget(); Serial.println("RING olvidado"); return; }
+  if (!strcmp(sub, "learn")) {
+    if (!g_inMenu && !g_m.armed()) { menuOpen(); g_menuMask = false; }
+    if (!g_inMenu && g_lcdOk) { Serial.println("ERR asistente solo desarmado"); return; }
+    learnStart();
+    return;
+  }
+  if (!strcmp(sub, "next")) { learnSkip(); return; }
+  if (!strcmp(sub, "seen")) { ring::printSeen(Serial); return; }
+  if (!strcmp(sub, "mon")) { g_ringMon = argc > 2 && !strcmp(argv[2], "on"); Serial.printf("RING monitor %s\n", g_ringMon ? "on" : "off"); return; }
+  if (!strcmp(sub, "clear")) {
+    ringmap::clear(g_ringTbl);
+    Serial.printf("RING firmas borradas (%s)\n", ring::saveTable(g_ringTbl) ? "guardado" : "ERROR NVS");
+    return;
+  }
+  if (!strcmp(sub, "click")) {
+    int b = argc > 2 ? atoi(argv[2]) : 0;
+    if (b < 1 || b > 3) { Serial.println("ERR uso: ring click <1-3>"); return; }
+    uint32_t now = micros();
+    logAdd('I', (uint8_t)In::Ring, b - 1, 1);
+    dispatch(g_actBuf, g_m.feed(In::Ring, b - 1, now, g_actBuf, 16));
+    Serial.printf("RING click inyectado: boton %s (armado=%d)\n", kRingBtn[b - 1], g_m.armed());
+    return;
+  }
+  if (!strcmp(sub, "log")) {
+    uint32_t n = g_ringLogN, from = n > 64 ? n - 64 : 0;
+    Serial.printf("RINGLOG %u reportes (ultimos %u): t_us handle bytes\n", (unsigned)n, (unsigned)(n - from));
+    for (uint32_t k = from; k < n; k++) {
+      const ring::Report &r = g_ringLog[k & 63];
+      Serial.printf("  %10u h=0x%04X", (unsigned)r.t, r.src);
+      for (int i = 0; i < r.len; i++) Serial.printf(" %02X", r.data[i]);
+      Serial.println();
+    }
+    return;
+  }
+  if (*sub) { Serial.println("ERR uso: ring [pair|forget|learn|next|clear|log|click <1-3>]"); return; }
+  Serial.printf("RING heap libre=%u (bloque mayor %u)\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  Serial.printf("RING estado=%s emparejado=%s dir=%s reportes_hid=%d emparejar=%s firmas=%d caidas=%u\n", ring::stateName(),
+                ring::paired() ? "si" : "no", ring::paired() ? ring::address().c_str() : "-", ring::reportChars(),
+                ring::pairResultName(), g_ringTbl.count, (unsigned)ring::lostCount());
+  for (int i = 0; i < g_ringTbl.count; i++)
+    Serial.printf("  firma %2d: boton %s x%u, %u reportes, hash %08X\n", i, kRingBtn[g_ringTbl.sigs[i].button],
+                  g_ringTbl.sigs[i].clicks, g_ringTbl.sigs[i].n, (unsigned)g_ringTbl.sigs[i].hash);
+}
+
+// ---------------------------------------------------------------- batería / consumo (fase 0 de power)
+// Fuel-gauge BQ27220 por I2C (0x55, SDA=8/SCL=18). El T-Embed CC1101 no tiene ADC de batería; se mide por este
+// gauge (driver vendorizado de LilyGO en lib/bq27220). SOLO lectura: no se llama init() (reprogramaría la
+// data-memory del gauge). `getCurrent()` viene con signo: + = cargando, − = descargando (consumo real).
+static BQ27220 g_gauge;
+static bool g_gaugeOk;
+
+static void cmdPwr() {
+  if (!g_gaugeOk) { Serial.println("PWR gauge BQ27220 no inicializado"); return; }
+  uint16_t mv = g_gauge.getVoltage();            // mV
+  int16_t cur = g_gauge.getCurrent();            // mA, + carga / − descarga
+  uint16_t soc = g_gauge.getStateOfCharge();     // %
+  uint16_t rem = g_gauge.getRemainingCapacity(); // mAh
+  uint16_t fcc = g_gauge.getFullChargeCapacity();// mAh
+  const char *dir = cur > 0 ? "cargando" : (cur < 0 ? "descarga" : "reposo");
+  bool sane = mv > 2500 && mv < 4500;  // fuera de rango → probable que el gauge no respondió
+  Serial.printf("PWR soc=%u%% v=%u mV i=%d mA (%s) rem=%u/%u mAh cpu=%u MHz%s\n", soc, mv, cur, dir, rem, fcc,
+                (unsigned)getCpuFrequencyMhz(), sane ? "" : "  [¿gauge sin responder? v fuera de rango]");
+  Serial.printf("PWR heap libre=%u interno=%u mayor_bloque_interno=%u\n", (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// Indicador de batería del menú: misma fuente que `pwr` (fuel-gauge BQ27220, solo lectura). Lo invoca uiUpdateBattery
+// desde menuOpen (inmediato) y pollUi (cada 3 s), en el contexto del loop (core 1) → no toca el bus SPI del LCD, así
+// que no necesita lcdLock. Color: cian=cargando, verde>50%, ámbar 20-50%, rojo<20%, gris=sin lectura.
+static void uiUpdateBattery() {
+  if (!g_batLabel) return;
+  auto noRead = [] {
+    lv_label_set_text(g_batLabel, "Bateria: sin lectura");
+    lv_obj_set_style_text_color(g_batLabel, lv_color_hex(0x9E9E9E), 0);
+  };
+  if (!g_gaugeOk) { noRead(); return; }
+  uint16_t mv = g_gauge.getVoltage();
+  int16_t cur = g_gauge.getCurrent();         // + carga / − descarga
+  uint16_t soc = g_gauge.getStateOfCharge();  // %
+  if (mv <= 2500 || mv >= 4500) { noRead(); return; }  // fuera de rango → el gauge no respondió
+  char buf[48];
+  if (cur > 5) snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V  cargando", soc, mv / 1000, (mv % 1000) / 10);
+  else if (cur < -5) snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V  %d mA", soc, mv / 1000, (mv % 1000) / 10, cur);
+  else snprintf(buf, sizeof buf, "Bateria %u%%  %u.%02u V", soc, mv / 1000, (mv % 1000) / 10);
+  lv_label_set_text(g_batLabel, buf);
+  uint32_t col = cur > 5 ? 0x4DD0E1 : soc > 50 ? 0x66BB6A : soc >= 20 ? 0xFFB300 : 0xEF5350;
+  lv_obj_set_style_text_color(g_batLabel, lv_color_hex(col), 0);
+}
+
+// ---------------------------------------------------------------- sleep (fases 3 y 4 de power)
+// DESARMADO e inactivo: tras T1 entra en LIGHT SLEEP (~mA, conserva estado, despierta con la rueda/botón/KEY y
+// puede armarse de corrido); si sigue inactivo hasta T2 escala a DEEP SLEEP (apaga con PWR_EN como el firmware de
+// fábrica, ~µA, despierta con KEY y rebootea). Nunca duerme armado, en pulso, con el menú abierto, con TX encolada
+// ni con USB conectado (para no cortar el serial en el banco). El wake por GPIO es por nivel opuesto al actual
+// (la rueda puede descansar con A o B en bajo), así cualquier cambio despierta.
+static constexpr uint32_t T1_LIGHT_MS = 20000;   // inactivo 20 s → light sleep
+static constexpr uint32_t T2_DEEP_MS = 300000;   // inactivo 5 min → deep sleep
+static constexpr int SLEEP_PINS[] = {PIN_ENC_A, PIN_ENC_B, PIN_ENC_BTN, PIN_KEY};
+
+static void gpioWakeArm() {
+  for (int p : SLEEP_PINS)
+    gpio_wakeup_enable((gpio_num_t)p, digitalRead(p) ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+}
+
+static void enterLightSleep(uint32_t timerMs) {
+  gpioWakeArm();
+  if (timerMs) esp_sleep_enable_timer_wakeup((uint64_t)timerMs * 1000);  // para escalar a deep sin más input
+  esp_light_sleep_start();
+  for (int p : SLEEP_PINS) gpio_wakeup_disable((gpio_num_t)p);
+  // Al despertar: el PCNT no contó dormido y el gesto quedó viejo → limpiar para que un wiggle continuo arme.
+  if (g_pcnt) { pcnt_unit_clear_count(g_pcnt); g_lastCount = 0; }
+  g_m.reset(g_cfg5, micros());
+  g_lastInputMs = millis();
+}
+
+static void enterDeepSleep() {
+  rgbLedWrite(14, 0, 0, 0);
+  digitalWrite(PIN_LCD_BL, LOW);
+  if (g_lcdOk) g_lcd.sleep();
+  rfLock(); cc1101Sleep(); rfUnlock();
+  for (int p : {PIN_LCD_CS, PIN_SD_CS, PIN_NRF_CS, PIN_CSN}) digitalWrite(p, HIGH);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY);
+  esp_sleep_enable_ext1_wakeup(1ULL << PIN_KEY, ESP_EXT1_WAKEUP_ANY_LOW);  // wake con KEY (GPIO6, activo bajo)
+  digitalWrite(PIN_PWR_EN, LOW);  // latch del board (igual que fábrica): corta WS2812/housekeeping → ~µA
+  esp_deep_sleep_start();         // no retorna: al presionar KEY rebootea desde setup()
+}
+
+// Llamada al final de loop(): decide si corresponde dormir.
+static void maybeSleep() {
+  if (!g_autoSleep || g_inMenu || g_m.armed() || g_m.pressActive()) return;
+  if (uxQueueMessagesWaiting(g_txQueue)) return;  // hay pulsos por salir
+  if (ring::isUp()) return;                       // el BLE aún se está apagando: el controlador no sobrevive dormido
+  if (Serial) return;                             // USB conectado (banco/cargando): no dormir, mantener serial
+  uint32_t idle = millis() - g_lastInputMs;
+  if (idle < T1_LIGHT_MS) return;
+  if (idle >= T2_DEEP_MS) enterDeepSleep();
+  else enterLightSleep(T2_DEEP_MS - idle);
+}
+
+// `sleep` estado; `sleep on|off` habilita/deshabilita (persistente); `sleep now` fuerza un light sleep de prueba.
+static void cmdSleep(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "now")) {
+    Serial.println("SLEEP light 5 s de prueba (se corta el serial; move la rueda o espera)...");
+    delay(50);
+    enterLightSleep(5000);
+    Serial.println("SLEEP desperto");
+    return;
+  }
+  if (argc > 1 && (!strcmp(argv[1], "on") || !strcmp(argv[1], "off"))) {
+    g_autoSleep = !strcmp(argv[1], "on");
+    Preferences p;
+    if (p.begin("t60", false)) { p.putBool("autoslp", g_autoSleep); p.end(); }
+  } else if (argc > 1) {
+    Serial.println("ERR uso: sleep [on|off|now]");
+    return;
+  }
+  Serial.printf("SLEEP auto=%s (T1=%lus light, T2=%lus deep; no duerme con USB conectado)\n",
+                g_autoSleep ? "on" : "off", (unsigned long)(T1_LIGHT_MS / 1000),
+                (unsigned long)(T2_DEEP_MS / 1000));
+}
+
 // ---------------------------------------------------------------- setup/loop
 void setup() {
   pinMode(PIN_GDO0, INPUT);  // hasta que GDO0 quede en alta impedancia en el CC1101
@@ -1546,6 +2071,12 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(100);
 
+  // Fase 1 (power): correr a 80 MHz en vez de 240 → ~2× autonomía armado. El APB queda fijo en 80 MHz para
+  // CPU ≥ 80, así que RMT/PCNT/I2S/USB-CDC no cambian y la trama de 104.2 µs NO se mueve. 80 MHz es el piso:
+  // por debajo el APB seguiría al CPU y rompería el timing de la TX. Se sube a 240 solo alrededor del
+  // capture()/report de los comandos de banco (tx/txramp), que muestrean GPIO3 por ciclos de CPU.
+  setCpuFrequencyMhz(80);
+
   g_spiLock = xSemaphoreCreateMutex();
   g_rfMutex = xSemaphoreCreateMutex();
   // LCD ANTES que el CC1101: su init hace SPI.end()/SPI.begin() y resetea el periférico FSPI (ver lcd.h).
@@ -1561,11 +2092,12 @@ void setup() {
   cc1101Reset();
   cc1101Config();  // IOCFG0=0x2E antes de que el RMT tome GPIO3 como salida
   rmtInit();
+  cc1101Sleep();  // Fase 2: arranca DESARMADO → el CC1101 duerme; el primer armado/TX lo despierta
 
   xTaskCreatePinnedToCore(wdTask, "t60wd", 3072, nullptr, configMAX_PRIORITIES - 2, &g_wdTask, 0);
 
-  g_edges = (Edge *)heap_caps_malloc(MAX_EDGES * sizeof(Edge), MALLOC_CAP_INTERNAL);
-  g_enc = (EncT *)heap_caps_malloc(MAX_ENC * sizeof(EncT), MALLOC_CAP_INTERNAL);
+  g_runs = (t60::Run *)heap_caps_malloc(RUNS_CAP * sizeof(t60::Run), MALLOC_CAP_SPIRAM);
+  if (!g_runs) g_runs = (t60::Run *)heap_caps_malloc(RUNS_CAP * sizeof(t60::Run), MALLOC_CAP_INTERNAL);  // sin PSRAM
   g_seq = esp_random() & 0xFE;
 
   // --- fase 5: control por gestos ---
@@ -1577,12 +2109,17 @@ void setup() {
     g_lightMode = settings::loadLightMode(st);
     g_shockOn = ALLOW_SHOCK && settings::loadShock(st);
   }
+  { Preferences p; if (p.begin("t60", true)) { g_autoSleep = p.getBool("autoslp", true); p.end(); } }  // fase 3/4
   g_m.reset(g_cfg5, micros());  // arranca DESARMADO
   encoderInit();
   audioInit();  // parlante para beeps locales (confirmación de armado); nunca estimula el collar
+  g_gaugeOk = g_gauge.begin();  // I2C del fuel-gauge BQ27220 (SDA=8/SCL=18); medición de batería por `pwr`
   xTaskCreatePinnedToCore(txTask, "t60tx", 4096, nullptr, 3, nullptr, 0);
   rgbLedWrite(14, 0, 0, 0);  // LED apagado = desarmado
   if (g_lcdOk) uiInit();     // LVGL listo pero sin correr: la pantalla queda apagada hasta la combinación
+  ring::loadTable(g_ringTbl);  // firmas de botones del anillo (vacía si nunca se hizo el asistente)
+  ring::begin();               // BLE solo si hay un anillo emparejado
+  g_lastInputMs = millis();  // arranca el contador de inactividad del auto-sleep desde el boot
 }
 
 void loop() {
@@ -1599,5 +2136,11 @@ void loop() {
     }
   }
   pollGestures();  // encoder + botones + máquina de gestos + feedback (no bloquea; la TX va en su tarea)
+  pollRing();      // anillo BLE: reportes → clicks → máquina de gestos (o asistente de botones)
   pollUi();        // menú LVGL: solo con la pantalla encendida y el RF libre
+  maybeSleep();    // fases 3/4: desarmado+inactivo → light sleep y, más tarde, deep sleep
+  // Ceder el núcleo en vez de girar al 100 %: mientras loop() duerme, la tarea idle deja la CPU en WAITI (detenida
+  // hasta la próxima interrupción). El encoder lo cuenta el PCNT por hardware y los botones tienen 5 ms de debounce,
+  // así que sondear cada 2 ms (armado / menú) o 5 ms (desarmado, hasta que entra el light sleep) no pierde nada.
+  vTaskDelay(pdMS_TO_TICKS(g_inMenu || g_m.armed() ? 2 : 5));
 }

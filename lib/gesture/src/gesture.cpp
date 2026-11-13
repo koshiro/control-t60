@@ -31,6 +31,8 @@ Config defaults() {
   c.wiggleGapUs = 500000;  // cada reversa dentro de 500 ms de la anterior para contar como wiggle
   c.armGraceUs = 800000;   // 0.8 s tras armar sin emitir nada (la cola del wiggle no dispara una rampa/shock)
   c.safeClicks = 2;        // zona de seguridad: 1-2 clicks = solo wiggle; desde el 3.º = rampa (pedido de Daniel)
+  c.ringMultiUs = 350000;  // anillo: 350 ms entre clicks (PROVISIONAL: afinar con el anillo real, que llega por BLE)
+  c.vibrHighPower = 25;    // anillo: vibrar fuerte (= TOPE por defecto)
   return c;
 }
 
@@ -52,6 +54,7 @@ void Machine::reset(const Config &c, uint32_t now) {
   if (cfg_.minRamp > cfg_.cap) cfg_.minRamp = cfg_.cap;
   if (cfg_.keyVibrPower > cfg_.cap) cfg_.keyVibrPower = cfg_.cap;
   if (cfg_.keyTonoPower > cfg_.cap) cfg_.keyTonoPower = cfg_.cap;
+  if (cfg_.vibrHighPower > cfg_.cap) cfg_.vibrHighPower = cfg_.cap;
   if (cfg_.step < 1) cfg_.step = 1;
   armed_ = false;            // SIEMPRE arranca desarmado (H4/H6)
   ramp_ = cfg_.minRamp;
@@ -68,6 +71,43 @@ void Machine::reset(const Config &c, uint32_t now) {
   haveStim_ = false;
   lastStimStart_ = 0;
   startCount_ = startHead_ = 0;
+  ringStop();
+  ringMute_ = false;
+}
+
+void Machine::ringStop() {
+  ringSeq_ = false;
+  ringSeqLeft_ = 0;
+  ringCount_ = 0;
+  ringBtn_ = -1;
+}
+
+// Cierra la cuenta de clicks del anillo: 1 = suave, 2 = fuerte, 3 = rampa (botones 0 y 1) o luz (botón 2).
+// Todo estímulo pasa por tryStart (cadencia + tope por minuto) y por clampPow (TOPE), igual que los gestos locales.
+void Machine::ringResolve(uint32_t now, Action *out, int maxOut, int &n) {
+  int8_t b = ringBtn_;
+  uint8_t c = ringCount_;
+  ringCount_ = 0;
+  ringBtn_ = -1;
+  if (!armed_ || c == 0 || b < 0 || b > 2) return;
+  if (b == 2 && c >= 3) {  // luz: no es estímulo → no consume cadencia ni cupo
+    push(out, maxOut, n, Act::LightToggle, Mode::Luz, 0);
+    return;
+  }
+  if (c >= 3 || (b == 2 && c == 2)) {  // secuencia: rampa (sube PASO por pulso) o doble tono (2 pulsos iguales)
+    ringSeq_ = true;
+    ringSeqStart_ = now;
+    ringSeqMode_ = b == 0 ? Mode::Vibrar : b == 1 ? Mode::Shock : Mode::Tono;
+    ringSeqStep_ = b == 2 ? 0 : cfg_.step;
+    ringSeqLeft_ = b == 2 ? 2 : 255;  // 255 = sin límite de pulsos (lo corta maxRampUs)
+    ringSeqPow_ = b == 2 ? cfg_.keyTonoPower : cfg_.minRamp;
+    return;  // el primer pulso sale en el próximo tick()
+  }
+  Mode m = b == 0 ? Mode::Vibrar : b == 1 ? Mode::Shock : Mode::Tono;
+  uint8_t p = b == 0 ? (c == 1 ? cfg_.keyVibrPower : cfg_.vibrHighPower)
+            : b == 1 ? (c == 1 ? cfg_.lowPower : cfg_.highPower)
+                     : cfg_.keyTonoPower;
+  if (tryStart(now)) emitPulse(m, p, out, maxOut, n);
 }
 
 void Machine::push(Action *out, int maxOut, int &n, Act a, Mode m, uint8_t p) {
@@ -110,6 +150,17 @@ bool Machine::tryStart(uint32_t now) {
 int Machine::feed(In in, int32_t data, uint32_t now, Action *out, int maxOut) {
   int n = 0;
   if (armed_) lastActivity_ = now;  // cualquier evento con el equipo armado cuenta como actividad
+  // Secuencia del anillo en curso (rampa / doble tono): CUALQUIER entrada la corta y se consume (no hace nada más).
+  // Tras cortar con el anillo, sus clicks se ignoran un momento (un doble click para frenar no dispara otra cosa).
+  if (ringSeq_) {
+    ringStop();
+    if (in == In::Ring) { ringMute_ = true; ringMuteStart_ = now; }
+    return 0;
+  }
+  if (in == In::RingLost) {  // sin enlace: descartar la cuenta pendiente (nada sale "en diferido")
+    ringStop();
+    return 0;
+  }
   bool busy = rampActive_ || tonoActive_;  // una sola cosa en curso (H5)
 
   switch (in) {
@@ -148,6 +199,7 @@ int Machine::feed(In in, int32_t data, uint32_t now, Action *out, int maxOut) {
           lastDir_ = dir;
           rampActive_ = tonoActive_ = doublePending_ = false;
           clickCount_ = 0;
+          ringStop();
           // NO se emite nada al collar: la confirmación de armado es un beep LOCAL del parlante del T-Embed
           // (lo hace el firmware al detectar el cambio de armed()). Aquí solo se cambia el estado.
           if (!armed_) {
@@ -179,6 +231,21 @@ int Machine::feed(In in, int32_t data, uint32_t now, Action *out, int maxOut) {
       break;
     }
 
+    case In::Ring: {
+      if (ringMute_) {
+        if ((uint32_t)(now - ringMuteStart_) < cfg_.ringMultiUs) { ringMuteStart_ = now; break; }
+        ringMute_ = false;
+      }
+      if (!armed_ || busy || data < 0 || data > 2) break;  // H10 · H5 · botón desconocido
+      if (ringCount_ > 0 && data != ringBtn_) ringResolve(now, out, maxOut, n);  // otro botón: cerrar el anterior
+      ringBtn_ = (int8_t)data;
+      ringLastUs_ = now;
+      if (++ringCount_ >= 3) ringResolve(now, out, maxOut, n);  // 3 clicks: no hay nada más que esperar
+      break;
+    }
+
+    case In::RingLost: break;  // atendido arriba
+
     case In::KeyDown:
       keyDown_ = true;
       keyDownUs_ = now;
@@ -208,6 +275,23 @@ int Machine::tick(uint32_t now, Action *out, int maxOut) {
     armed_ = false;
     rampActive_ = tonoActive_ = doublePending_ = false;
     clickCount_ = 0;
+    ringStop();
+  }
+
+  // Anillo: la ventana de multi-click venció → cerrar la cuenta (1 o 2 clicks).
+  if (ringCount_ > 0 && (uint32_t)(now - ringLastUs_) > cfg_.ringMultiUs) {
+    if (rampActive_ || tonoActive_) ringStop();
+    else ringResolve(now, out, maxOut, n);
+  }
+  // Anillo: secuencia en curso → un pulso por cadencia; fin por cantidad (doble tono) o por duración máxima (rampa).
+  if (ringSeq_) {
+    if (!armed_ || (uint32_t)(now - ringSeqStart_) >= cfg_.maxRampUs) {
+      ringStop();
+    } else if (tryStart(now)) {
+      ringSeqPow_ = clampPow(ringSeqPow_ + ringSeqStep_);
+      emitPulse(ringSeqMode_, ringSeqPow_, out, maxOut, n);
+      if (ringSeqLeft_ != 255 && --ringSeqLeft_ == 0) ringStop();
+    }
   }
 
   // Click simple: la ventana de doble venció sin segundo click y sin botón apretado → BAJO.
@@ -237,11 +321,12 @@ int Machine::tick(uint32_t now, Action *out, int maxOut) {
   }
 
   // Auto-desarme por inactividad (H6), solo si está activado y no hay nada en curso ni KEY apretada.
-  if (cfg_.autoDisarm && armed_ && !rampActive_ && !tonoActive_ && !keyDown_ &&
+  if (cfg_.autoDisarm && armed_ && !rampActive_ && !tonoActive_ && !ringSeq_ && ringCount_ == 0 && !keyDown_ &&
       (uint32_t)(now - lastActivity_) >= cfg_.autoDisarmUs) {
     armed_ = false;
     clickCount_ = 0;
     doublePending_ = false;
+    ringStop();
   }
   return n;
 }

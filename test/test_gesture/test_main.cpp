@@ -79,6 +79,8 @@ static Violation check(const std::vector<Rec> &rec, const Config &cfg) {
         lastStart = rec[k].t;
         haveStart = true;
       }
+    } else if (a.act == Act::LightToggle) {
+      if (!rec[k].armed) return {"luz del anillo estando desarmado", (int)k};
     } else if (a.act == Act::Release) {
       if (!open) return {"soltar sin pulsación abierta", (int)k};
       open = false;
@@ -440,8 +442,9 @@ static void test_fuzz_random_sequences() {
         int nn = m.tick(t, out, 8);
         for (int k = 0; k < nn; k++) rec.push_back({t, out[k], m.armed()});
       }
-      In in = (In)(rng() % 5);
-      int32_t data = (rng() & 1) ? +1 : -1;
+      In in = (In)(rng() % 7);  // incluye Ring y RingLost
+      int32_t data = in == In::Ring ? (int32_t)(rng() % 4) - 0 : (rng() & 1) ? +1 : -1;  // botón 0..2 (y 3 = inválido)
+      if (in == In::Ring && rng() % 2) t -= rng() % 900;  // clicks del anillo casi pegados (multi-click)
       int nn = m.feed(in, data, t, out, 8);
       for (int k = 0; k < nn; k++) rec.push_back({t, out[k], m.armed()});
     }
@@ -626,8 +629,142 @@ static void test_shock_switch_substitution() {
     for (bool on : {false, true}) TEST_ASSERT_EQUAL_INT((int)m, (int)effectiveMode(m, on));
 }
 
+// ================================ anillo (Ring01) ================================
+// Arma, alimenta clicks del anillo (t, botón) y devuelve el registro. `shockT` = instantes extra de otros eventos.
+static std::vector<Rec> ringRun(const std::vector<Step> &steps, Config c = defaults()) {
+  Machine m;
+  m.reset(c, 0);
+  uint32_t t0 = armDirect(m);
+  std::vector<Rec> rec;
+  run(m, steps, rec, t0);
+  Violation v = check(rec, m.config());
+  TEST_ASSERT_NULL_MESSAGE(v.rule, v.rule ? v.rule : "");
+  return rec;
+}
+static std::vector<Action> stims(const std::vector<Rec> &rec) {
+  std::vector<Action> v;
+  for (auto &r : rec)
+    if (r.a.act == Act::Stim || r.a.act == Act::LightToggle) v.push_back(r.a);
+  return v;
+}
+static const uint32_t T0 = 3000000;  // después del armado y de la pausa de gracia
+
+static void test_ring_single_click_per_button() {
+  Config c = defaults();
+  struct { int btn; Mode m; uint8_t p; } exp[] = {
+    {0, Mode::Vibrar, c.keyVibrPower}, {1, Mode::Shock, c.lowPower}, {2, Mode::Tono, c.keyTonoPower}};
+  for (auto &e : exp) {
+    auto s = stims(ringRun({{T0, In::Ring, e.btn}}));
+    TEST_ASSERT_EQUAL(1, (int)s.size());
+    TEST_ASSERT_EQUAL((int)e.m, (int)s[0].mode);
+    TEST_ASSERT_EQUAL(e.p, s[0].power);
+  }
+}
+
+static void test_ring_double_click_strong() {
+  Config c = defaults();
+  auto s = stims(ringRun({{T0, In::Ring, 0}, {T0 + 200000, In::Ring, 0}}));
+  TEST_ASSERT_EQUAL(1, (int)s.size());  // un solo estímulo: el fuerte, sin el suave antes
+  TEST_ASSERT_EQUAL((int)Mode::Vibrar, (int)s[0].mode);
+  TEST_ASSERT_EQUAL(c.vibrHighPower, s[0].power);
+  s = stims(ringRun({{T0, In::Ring, 1}, {T0 + 200000, In::Ring, 1}}));
+  TEST_ASSERT_EQUAL(1, (int)s.size());
+  TEST_ASSERT_EQUAL((int)Mode::Shock, (int)s[0].mode);
+  TEST_ASSERT_EQUAL(c.highPower, s[0].power);
+  s = stims(ringRun({{T0, In::Ring, 2}, {T0 + 200000, In::Ring, 2}}));  // "otro sonido" = doble tono
+  TEST_ASSERT_EQUAL(2, (int)s.size());
+  for (auto &a : s) { TEST_ASSERT_EQUAL((int)Mode::Tono, (int)a.mode); TEST_ASSERT_EQUAL(c.keyTonoPower, a.power); }
+}
+
+static void test_ring_triple_click_ramp_and_light() {
+  Config c = defaults();
+  for (int btn = 0; btn < 2; btn++) {
+    auto s = stims(ringRun({{T0, In::Ring, btn}, {T0 + 200000, In::Ring, btn}, {T0 + 400000, In::Ring, btn}}));
+    TEST_ASSERT_TRUE(s.size() >= 3);                                   // rampa: varios pulsos…
+    TEST_ASSERT_TRUE(s.size() <= c.maxRampUs / c.minStimGapUs + 1);    // …acotada por maxRampUs
+    for (size_t i = 0; i < s.size(); i++) {
+      TEST_ASSERT_EQUAL((int)(btn == 0 ? Mode::Vibrar : Mode::Shock), (int)s[i].mode);
+      TEST_ASSERT_EQUAL(c.minRamp + c.step * (i + 1), s[i].power);     // sube PASO por pulso desde el piso
+    }
+  }
+  auto s = stims(ringRun({{T0, In::Ring, 2}, {T0 + 200000, In::Ring, 2}, {T0 + 400000, In::Ring, 2}}));
+  TEST_ASSERT_EQUAL(1, (int)s.size());
+  TEST_ASSERT_EQUAL((int)Act::LightToggle, (int)s[0].act);
+}
+
+static void test_ring_ramp_cancelled_by_any_input() {
+  // click del anillo, rueda, botón y KEY cortan la rampa; el evento que corta no dispara nada.
+  std::vector<Step> base = {{T0, In::Ring, 1}, {T0 + 200000, In::Ring, 1}, {T0 + 400000, In::Ring, 1}};
+  size_t full = stims(ringRun(base)).size();
+  struct { In in; int32_t d; } cut[] = {{In::Ring, 1}, {In::Ring, 0}, {In::Wheel, 1}, {In::BtnDown, 0}, {In::KeyDown, 0},
+                                        {In::RingLost, 0}};
+  for (auto &k : cut) {
+    auto st = base;
+    st.push_back({T0 + 1500000, k.in, k.d});                 // tras el 2.º pulso de la rampa
+    if (k.in == In::Ring) st.push_back({T0 + 1700000, In::Ring, k.d});  // doble click para frenar: tampoco dispara
+    if (k.in == In::BtnDown) st.push_back({T0 + 1600000, In::BtnUp, 0});
+    if (k.in == In::KeyDown) st.push_back({T0 + 1600000, In::KeyUp, 0});
+    auto s = stims(ringRun(st));
+    TEST_ASSERT_EQUAL_MESSAGE(2, (int)s.size(), "la rampa debe cortarse y nada más debe salir");
+    TEST_ASSERT_TRUE(s.size() < full);
+  }
+}
+
+static void test_ring_disarmed_and_lost_are_silent() {
+  Machine m;
+  m.reset(defaults(), 0);
+  std::vector<Rec> rec;
+  run(m, {{T0, In::Ring, 1}, {T0 + 100000, In::Ring, 1}, {T0 + 200000, In::Ring, 1}, {T0 + 2000000, In::Ring, 2},
+          {T0 + 2100000, In::Ring, 2}, {T0 + 2200000, In::Ring, 2}}, rec);
+  TEST_ASSERT_EQUAL(0, (int)rec.size());  // desarmado: ni estímulos ni luz
+  // enlace caído con un click pendiente → no sale en diferido
+  TEST_ASSERT_EQUAL(0, (int)stims(ringRun({{T0, In::Ring, 1}, {T0 + 100000, In::RingLost, 0}})).size());
+  // botón inválido
+  TEST_ASSERT_EQUAL(0, (int)stims(ringRun({{T0, In::Ring, 3}, {T0 + 2000000, In::Ring, -1}})).size());
+}
+
+static void test_ring_other_button_and_rate_limit() {
+  Config c = defaults();
+  // botón 0 y enseguida botón 2: sale el primero; el segundo cae dentro de la cadencia mínima → descartado.
+  auto s = stims(ringRun({{T0, In::Ring, 0}, {T0 + 150000, In::Ring, 2}}));
+  TEST_ASSERT_EQUAL(1, (int)s.size());
+  TEST_ASSERT_EQUAL((int)Mode::Vibrar, (int)s[0].mode);
+  // separados más que la cadencia: salen los dos
+  s = stims(ringRun({{T0, In::Ring, 0}, {T0 + 2000000, In::Ring, 2}}));
+  TEST_ASSERT_EQUAL(2, (int)s.size());
+  // niveles por encima del TOPE se recortan
+  c.cap = 8;
+  c.vibrHighPower = 60;
+  s = stims(ringRun({{T0, In::Ring, 0}, {T0 + 200000, In::Ring, 0}}, c));
+  TEST_ASSERT_EQUAL(8, s[0].power);
+}
+
+static void test_ring_keeps_armed_and_wiggle_stops_ramp() {
+  Config c = defaults();
+  c.autoDisarmUs = 5000000;
+  Machine m;
+  m.reset(c, 0);
+  armDirect(m);
+  Action o[8];
+  uint32_t t = T0;
+  for (int i = 0; i < 6; i++, t += 3000000) {  // un click cada 3 s durante 18 s > auto-desarme
+    m.feed(In::Ring, 0, t, o, 8);
+    for (uint32_t k = t; k < t + 3000000; k += 20000) m.tick(k, o, 8);
+    TEST_ASSERT_TRUE(m.armed());
+  }
+  for (uint32_t k = t; k < t + 6000000; k += 20000) m.tick(k, o, 8);
+  TEST_ASSERT_FALSE(m.armed());  // sin actividad → se desarma igual que siempre
+}
+
 int main() {
   UNITY_BEGIN();
+  RUN_TEST(test_ring_single_click_per_button);
+  RUN_TEST(test_ring_double_click_strong);
+  RUN_TEST(test_ring_triple_click_ramp_and_light);
+  RUN_TEST(test_ring_ramp_cancelled_by_any_input);
+  RUN_TEST(test_ring_disarmed_and_lost_are_silent);
+  RUN_TEST(test_ring_other_button_and_rate_limit);
+  RUN_TEST(test_ring_keeps_armed_and_wiggle_stops_ramp);
   RUN_TEST(test_arm_via_wiggle);
   RUN_TEST(test_few_reversals_dont_arm);
   RUN_TEST(test_arm_grace_suppresses_immediate);

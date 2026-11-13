@@ -19,6 +19,8 @@ static const Field kFields[kCount] = {
   {"paso", "Paso rampa", Unit::Level, 1, 10, 1},         // step: niveles que sube cada PULSO de la rampa
   {"adis", "Auto-desarme", Unit::Bool, 0, 1, 1},         // autoDisarm: desarme por inactividad on/off
   {"tblq", "Tiempo bloqueo", Unit::Sec, 10, 600, 10},    // autoDisarmUs: inactividad hasta desarmar
+  {"vibh", "Vibrar fuerte", Unit::Level, 0, 99, 1},      // vibrHighPower: doble click del botón de vibrar del anillo
+  {"rmul", "Anillo clicks", Unit::Ms, 200, 1000, 50},    // ringMultiUs: ventana para contar 1/2/3 clicks del anillo
 };
 
 const Field &field(int i) { return kFields[i]; }
@@ -51,6 +53,8 @@ int32_t get(const gesture::Config &c, int i) {
     case 9: return c.step;
     case 10: return c.autoDisarm ? 1 : 0;
     case 11: return (int32_t)(c.autoDisarmUs / 1000000);
+    case 12: return c.vibrHighPower;
+    case 13: return (int32_t)(c.ringMultiUs / 1000);
   }
   return 0;
 }
@@ -70,6 +74,8 @@ void set(gesture::Config &c, int i, int32_t v) {
     case 9: c.step = (uint8_t)v; break;
     case 10: c.autoDisarm = v != 0; break;
     case 11: c.autoDisarmUs = (uint32_t)v * 1000000; break;
+    case 12: c.vibrHighPower = (uint8_t)v; break;
+    case 13: c.ringMultiUs = (uint32_t)v * 1000; break;
   }
 }
 
@@ -80,6 +86,7 @@ void normalize(gesture::Config &c) {
   if (c.lowPower > c.cap) c.lowPower = c.cap;
   if (c.highPower > c.cap) c.highPower = c.cap;
   if (c.keyTonoPower > c.cap) c.keyTonoPower = c.cap;
+  if (c.vibrHighPower > c.cap) c.vibrHighPower = c.cap;
 }
 
 gesture::Config load(Store &s, const gesture::Config &base, int *found) {
